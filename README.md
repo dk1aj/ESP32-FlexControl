@@ -85,6 +85,3 @@ werden beim Loslassen nur seriell ausgegeben. Ein SmartSDR-Schreibzugriff folgt
 erst nach Klärung von Skalierung, Clientbindung und Rücklesebestätigung.
 
 Planung und nachgewiesener Fortschritt werden getrennt gepflegt:
-
-- [Entwicklungsplan](PLAN.md)
-- [Umsetzungs- und Teststand](DEVELOPMENT_PROGRESS.md)
