@@ -1,0 +1,33 @@
+# PlatformIO build output and downloaded dependencies
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# Local editor and workspace data
+.vscode/
+*.code-workspace
+
+# Local credentials and environment files
+/include/WifiSecrets.local.h
+.env
+.env.*
+!.env.example
+
+# Generated firmware and compiler artifacts
+*.bin
+*.elf
+*.hex
+*.map
+*.o
+*.d
+
+# Operating-system and diagnostic files
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.log
+
+# Local project history and publication notes
+/archive_not_for_github/
+/DEVELOPMENT_PROGRESS.md
+/PUBLISH_EXCLUDE.md
