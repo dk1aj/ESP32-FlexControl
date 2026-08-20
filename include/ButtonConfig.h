@@ -8,14 +8,19 @@ namespace ButtonConfig
 {
 enum class Action : uint8_t
 {
+    None,
     CycleFrequencyStep,
+    RoundFrequencyToKhz,
     RfPowerPreset
 };
 
-// Button assignment. Button 1 cycles the encoder tuning step; all remaining
-// buttons retain their provisional RF-power presets.
+// Button 1 controls the encoder tuning step. Buttons 4 through 11 select the
+// eight HF power presets. Buttons 2 and 3 intentionally have no action;
+// button 12 rounds the active Slice frequency to the nearest full kHz.
 constexpr Action BUTTON_ACTIONS[NeoKeyConfig::KEY_COUNT] = {
     Action::CycleFrequencyStep,
+    Action::None,
+    Action::None,
     Action::RfPowerPreset,
     Action::RfPowerPreset,
     Action::RfPowerPreset,
@@ -24,9 +29,7 @@ constexpr Action BUTTON_ACTIONS[NeoKeyConfig::KEY_COUNT] = {
     Action::RfPowerPreset,
     Action::RfPowerPreset,
     Action::RfPowerPreset,
-    Action::RfPowerPreset,
-    Action::RfPowerPreset,
-    Action::RfPowerPreset
+    Action::RoundFrequencyToKhz
 };
 
 constexpr uint16_t FREQUENCY_STEPS_HZ[] = {
@@ -40,18 +43,24 @@ constexpr uint8_t FREQUENCY_STEP_100_HZ_INDEX = 5;
 constexpr uint32_t DOUBLE_CLICK_WINDOW_MS = 350;
 constexpr uint32_t LONG_PRESS_MS = 700;
 
-// Initial RF-power presets for the twelve NeoKey buttons. These are defaults
-// only; a later persistent/external configuration can override them without
-// changing the matrix scanner or the radio transport.
+// Radio rfpower is a percentage. Watt values are labels matching the existing
+// Stream Deck setup for the 500 W HF maximum and are never sent to the Radio.
 constexpr uint16_t DEFAULT_RF_POWER_WATTS[NeoKeyConfig::KEY_COUNT] = {
-    45, 85, 125,
-    170, 210, 250,
-    295, 335, 375,
-    420, 460, 500
+    0, 0, 0,
+    10, 20, 50,
+    100, 200, 300,
+    400, 450, 0
 };
 
-constexpr uint16_t RF_POWER_STEP_WATTS = 5;
-constexpr uint16_t RF_POWER_MAX_WATTS = 500;
+constexpr uint8_t DEFAULT_RF_POWER_PERCENT[NeoKeyConfig::KEY_COUNT] = {
+    0, 0, 0,
+    2, 4, 10,
+    20, 40, 60,
+    80, 90, 0
+};
+
+constexpr uint64_t SIX_METER_MIN_HZ = 50000000ULL;
+constexpr uint64_t SIX_METER_MAX_HZ = 54000000ULL;
 
 constexpr uint16_t defaultRfPowerWatts(const uint8_t key)
 {
@@ -64,7 +73,20 @@ constexpr Action action(const uint8_t key)
 {
     return key >= 1 && key <= NeoKeyConfig::KEY_COUNT
                ? BUTTON_ACTIONS[key - 1]
-               : Action::RfPowerPreset;
+               : Action::None;
+}
+
+constexpr uint8_t defaultRfPowerPercent(const uint8_t key)
+{
+    return key >= 1 && key <= NeoKeyConfig::KEY_COUNT
+               ? DEFAULT_RF_POWER_PERCENT[key - 1]
+               : 0;
+}
+
+constexpr bool isSixMeterFrequency(const uint64_t frequencyHz)
+{
+    return frequencyHz >= SIX_METER_MIN_HZ &&
+           frequencyHz <= SIX_METER_MAX_HZ;
 }
 
 constexpr uint16_t frequencyStepHz(const uint8_t index)
@@ -86,19 +108,10 @@ static_assert(sizeof(DEFAULT_RF_POWER_WATTS) /
                       sizeof(DEFAULT_RF_POWER_WATTS[0]) ==
                   NeoKeyConfig::KEY_COUNT,
               "Each NeoKey button must have one RF-power preset");
-static_assert(DEFAULT_RF_POWER_WATTS[0] % RF_POWER_STEP_WATTS == 0 &&
-                  DEFAULT_RF_POWER_WATTS[1] % RF_POWER_STEP_WATTS == 0 &&
-                  DEFAULT_RF_POWER_WATTS[2] % RF_POWER_STEP_WATTS == 0 &&
-                  DEFAULT_RF_POWER_WATTS[3] % RF_POWER_STEP_WATTS == 0 &&
-                  DEFAULT_RF_POWER_WATTS[4] % RF_POWER_STEP_WATTS == 0 &&
-                  DEFAULT_RF_POWER_WATTS[5] % RF_POWER_STEP_WATTS == 0 &&
-                  DEFAULT_RF_POWER_WATTS[6] % RF_POWER_STEP_WATTS == 0 &&
-                  DEFAULT_RF_POWER_WATTS[7] % RF_POWER_STEP_WATTS == 0 &&
-                  DEFAULT_RF_POWER_WATTS[8] % RF_POWER_STEP_WATTS == 0 &&
-                  DEFAULT_RF_POWER_WATTS[9] % RF_POWER_STEP_WATTS == 0 &&
-                  DEFAULT_RF_POWER_WATTS[10] % RF_POWER_STEP_WATTS == 0 &&
-                  DEFAULT_RF_POWER_WATTS[11] % RF_POWER_STEP_WATTS == 0,
-              "RF-power presets must use 5 W steps");
-static_assert(DEFAULT_RF_POWER_WATTS[11] <= RF_POWER_MAX_WATTS,
-              "RF-power presets must not exceed the radio maximum");
+static_assert(sizeof(DEFAULT_RF_POWER_PERCENT) /
+                      sizeof(DEFAULT_RF_POWER_PERCENT[0]) ==
+                  NeoKeyConfig::KEY_COUNT,
+              "Each NeoKey button must have one RF-power percentage");
+static_assert(DEFAULT_RF_POWER_PERCENT[10] <= 100,
+              "RF-power presets must not exceed 100 percent");
 } // namespace ButtonConfig

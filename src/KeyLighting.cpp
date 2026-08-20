@@ -17,7 +17,13 @@ struct Color
 
 constexpr Color GREEN = {0, NeoPixelConfig::PRESSED_GREEN, 0};
 constexpr Color RED = {NeoPixelConfig::HELD_RED, 0, 0};
-constexpr uint32_t STARTUP_STEP_MS = 100;
+constexpr Color OFF = {0, 0, 0};
+constexpr Color ACTIVE_BLINK_BLUE = {
+    0, 0, NeoPixelConfig::ACTIVE_KEY_BLINK_BLUE_LEVEL};
+constexpr Color ACTIVE_STEADY_BLUE = {
+    0, 0, NeoPixelConfig::ACTIVE_KEY_STEADY_BLUE_LEVEL};
+constexpr uint8_t RADIO_ANIMATION_STEP_COUNT = NeoKeyConfig::ROW_COUNT;
+constexpr uint32_t RADIO_ANIMATION_STEP_MS = 100;
 
 Adafruit_NeoPixel pixels(NeoPixelConfig::PIXEL_COUNT,
                          NeoPixelConfig::DATA_PIN,
@@ -30,6 +36,11 @@ Color releaseStartColors[NeoKeyConfig::KEY_COUNT] = {};
 Color displayedColors[NeoKeyConfig::KEY_COUNT] = {};
 
 uint32_t previousUpdateMs = 0;
+uint32_t radioAnimationStartedMs = 0;
+uint8_t displayedRadioAnimationRow = UINT8_MAX;
+bool radioAnimationActive = false;
+uint8_t blinkingKey = 0;
+uint32_t blinkingKeySelectedMs = 0;
 bool pixelsPrepared = false;
 bool initialized = false;
 
@@ -47,6 +58,25 @@ Color backgroundColor(const uint8_t keyIndex)
         NeoPixelConfig::KEY_BACKGROUND_RGB[keyIndex][1],
         NeoPixelConfig::KEY_BACKGROUND_RGB[keyIndex][2]
     };
+}
+
+Color restingColor(const uint8_t keyIndex, const uint32_t nowMs)
+{
+    if (blinkingKey != keyIndex + 1U)
+    {
+        return backgroundColor(keyIndex);
+    }
+
+    const uint32_t selectedMs = nowMs - blinkingKeySelectedMs;
+    if (selectedMs >= NeoPixelConfig::ACTIVE_KEY_BLINK_DURATION_MS)
+    {
+        return ACTIVE_STEADY_BLUE;
+    }
+
+    const bool blinkOn =
+        ((selectedMs /
+          NeoPixelConfig::ACTIVE_KEY_BLINK_INTERVAL_MS) % 2U) == 0U;
+    return blinkOn ? ACTIVE_BLINK_BLUE : OFF;
 }
 
 uint8_t interpolateChannel(const uint8_t from,
@@ -109,19 +139,23 @@ void setKeyColor(const uint8_t keyIndex, const Color &color)
                          pixels.Color(color.red, color.green, color.blue));
 }
 
-void runStartupLight()
+void showRadioAnimationStep(const uint8_t animationRow)
 {
-    for (uint8_t keyIndex = 0;
-         keyIndex < NeoKeyConfig::KEY_COUNT;
-         ++keyIndex)
-    {
-        pixels.clear();
-        pixels.setPixelColor(
-            NeoPixelConfig::KEY_PIXEL_MAP[keyIndex],
-            pixels.Color(GREEN.red, GREEN.green, GREEN.blue));
-        pixels.show();
-        delay(STARTUP_STEP_MS);
-    }
+    pixels.clear();
+
+    // Both logical axes are reversed because the NeoKey is mounted upside
+    // down. Reverse the row for top-to-bottom motion and select the last
+    // logical column, which is the physical left column.
+    const uint8_t logicalRow = static_cast<uint8_t>(
+        NeoKeyConfig::ROW_COUNT - 1U - animationRow);
+    const uint8_t logicalColumn = static_cast<uint8_t>(
+        NeoKeyConfig::COLUMN_COUNT - 1U);
+    const uint8_t keyIndex = static_cast<uint8_t>(
+        logicalRow * NeoKeyConfig::COLUMN_COUNT + logicalColumn);
+    pixels.setPixelColor(
+        NeoPixelConfig::KEY_PIXEL_MAP[keyIndex],
+        pixels.Color(GREEN.red, GREEN.green, GREEN.blue));
+    pixels.show();
 }
 
 void preparePixels()
@@ -149,7 +183,6 @@ void clearForStartup()
 void begin()
 {
     preparePixels();
-    runStartupLight();
     pixels.clear();
 
     const uint32_t nowMs = millis();
@@ -171,6 +204,34 @@ void begin()
     initialized = true;
 }
 
+void startRadioConnectedAnimation(const uint32_t nowMs)
+{
+    if (!initialized)
+    {
+        return;
+    }
+
+    radioAnimationStartedMs = nowMs;
+    displayedRadioAnimationRow = UINT8_MAX;
+    radioAnimationActive = true;
+}
+
+void selectBlinkingKey(const uint8_t key, const uint32_t nowMs)
+{
+    if (!initialized || key < 1 || key > NeoKeyConfig::KEY_COUNT)
+    {
+        return;
+    }
+    blinkingKey = key;
+    blinkingKeySelectedMs = nowMs;
+}
+
+void clearBlinkingKey()
+{
+    blinkingKey = 0;
+    blinkingKeySelectedMs = 0;
+}
+
 void update(const uint32_t nowMs)
 {
     if (!initialized ||
@@ -180,6 +241,31 @@ void update(const uint32_t nowMs)
     }
     previousUpdateMs = nowMs;
 
+    if (radioAnimationActive)
+    {
+        const uint32_t elapsedMs = nowMs - radioAnimationStartedMs;
+        const uint8_t animationRow = static_cast<uint8_t>(
+            elapsedMs / RADIO_ANIMATION_STEP_MS);
+        if (animationRow < RADIO_ANIMATION_STEP_COUNT)
+        {
+            if (animationRow != displayedRadioAnimationRow)
+            {
+                showRadioAnimationStep(animationRow);
+                displayedRadioAnimationRow = animationRow;
+            }
+            return;
+        }
+
+        radioAnimationActive = false;
+        displayedRadioAnimationRow = UINT8_MAX;
+        for (uint8_t keyIndex = 0;
+             keyIndex < NeoKeyConfig::KEY_COUNT;
+             ++keyIndex)
+        {
+            displayedColors[keyIndex] = {UINT8_MAX, UINT8_MAX, UINT8_MAX};
+        }
+    }
+
     bool changed = false;
     for (uint8_t keyIndex = 0;
          keyIndex < NeoKeyConfig::KEY_COUNT;
@@ -187,7 +273,7 @@ void update(const uint32_t nowMs)
     {
         const uint8_t key = static_cast<uint8_t>(keyIndex + 1U);
         const bool pressed = NeoKey::isKeyPressed(key);
-        const Color currentBackground = backgroundColor(keyIndex);
+        const Color currentBackground = restingColor(keyIndex, nowMs);
 
         if (pressed && !previousPressed[keyIndex])
         {

@@ -28,6 +28,7 @@ portMUX_TYPE encoderMux = portMUX_INITIALIZER_UNLOCKED;
 volatile int64_t encoderLimitOffset = 0;
 int64_t zeroOffset = 0;
 uint8_t frequencyStepIndex = 0;
+uint8_t pendingRfPowerKey = 0;
 
 enum class StepKeyState : uint8_t
 {
@@ -368,6 +369,34 @@ void updateStepKeyGesture(const uint32_t nowMs)
     }
 }
 
+void roundActiveSliceToNearestKhz()
+{
+    uint64_t frequencyHz = 0;
+    if (!SmartSdrConnection::activeSliceFrequencyHz(frequencyHz))
+    {
+        Serial.println("[KEY] 12 round-to-kHz skipped: no unambiguous active slice");
+        return;
+    }
+
+    const uint16_t remainderHz = static_cast<uint16_t>(frequencyHz % 1000ULL);
+    const int64_t deltaHz = remainderHz < 500U
+                                ? -static_cast<int64_t>(remainderHz)
+                                : static_cast<int64_t>(1000U - remainderHz);
+    if (deltaHz == 0)
+    {
+        Serial.printf("[KEY] 12 round-to-kHz unchanged: frequency=%llu kHz\n",
+                      static_cast<unsigned long long>(frequencyHz / 1000ULL));
+        return;
+    }
+
+    const bool transmitted =
+        SmartSdrConnection::tuneActiveSliceByHz(deltaHz);
+    Serial.printf("[KEY] 12 round-to-kHz direction=%s delta=%lld Hz transmitted=%s\n",
+                  deltaHz > 0 ? "up" : "down",
+                  static_cast<long long>(deltaHz),
+                  transmitted ? "yes" : "no");
+}
+
 void processNeoKeyEvents(const uint32_t nowMs)
 {
     for (uint8_t key = 1; key <= NeoKeyConfig::KEY_COUNT; ++key)
@@ -382,6 +411,16 @@ void processNeoKeyEvents(const uint32_t nowMs)
             {
                 handleStepKeyPressed(nowMs);
             }
+            else if (ButtonConfig::action(key) ==
+                     ButtonConfig::Action::RfPowerPreset)
+            {
+                KeyLighting::selectBlinkingKey(key, nowMs);
+            }
+            else if (ButtonConfig::action(key) ==
+                     ButtonConfig::Action::RoundFrequencyToKhz)
+            {
+                roundActiveSliceToNearestKhz();
+            }
         }
         if (NeoKey::wasKeyReleased(key))
         {
@@ -390,16 +429,51 @@ void processNeoKeyEvents(const uint32_t nowMs)
             {
                 handleStepKeyReleased(nowMs);
             }
-            else
+            else if (ButtonConfig::action(key) ==
+                     ButtonConfig::Action::RfPowerPreset)
             {
-                Serial.printf("[KEY] %u RELEASED name=\"%s\" RF-preset=%u W\n",
+                const uint8_t percent =
+                    ButtonConfig::defaultRfPowerPercent(key);
+                const bool requested = pendingRfPowerKey == 0 &&
+                    SmartSdrConnection::requestRfPowerPercent(percent);
+                if (requested)
+                {
+                    pendingRfPowerKey = key;
+                }
+                Serial.printf("[KEY] %u RELEASED name=\"%s\" RF-preset=%u W/%u%% requested=%s\n",
                               key,
                               NeoKey::keyName(key),
-                              ButtonConfig::defaultRfPowerWatts(key));
+                              ButtonConfig::defaultRfPowerWatts(key),
+                              percent,
+                              requested ? "yes" : "no");
             }
         }
     }
     updateStepKeyGesture(nowMs);
+}
+
+void updateRfPowerRequest()
+{
+    const SmartSdrConnection::RfPowerRequestState requestState =
+        SmartSdrConnection::rfPowerRequestState();
+    if (requestState ==
+        SmartSdrConnection::RfPowerRequestState::Confirmed)
+    {
+        if (pendingRfPowerKey != 0)
+        {
+            Serial.printf("[KEY] %u RF preset confirmed\n",
+                          pendingRfPowerKey);
+        }
+        pendingRfPowerKey = 0;
+        SmartSdrConnection::clearRfPowerRequestResult();
+    }
+    else if (requestState ==
+             SmartSdrConnection::RfPowerRequestState::Failed)
+    {
+        Serial.printf("[KEY] RF preset failed; key indication retained\n");
+        pendingRfPowerKey = 0;
+        SmartSdrConnection::clearRfPowerRequestResult();
+    }
 }
 } // namespace
 
@@ -416,7 +490,7 @@ void setup()
 
     const esp_reset_reason_t resetReason = esp_reset_reason();
     Serial.println();
-    Serial.println("[BOOT] ESP32-S3 Handwheel FlexRadio Controller");
+    Serial.println("[BOOT] ESP32-S3 Handwheel Radio Controller");
     Serial.printf("[BOOT] Build: %s %s\n", __DATE__, __TIME__);
     Serial.printf("[BOOT] Reset reason: %s (%d)\n",
                   resetReasonName(resetReason),
@@ -453,8 +527,6 @@ void setup()
                   NeoKeyConfig::KEY_COUNT,
                   static_cast<unsigned long>(NeoKeyConfig::SCAN_INTERVAL_US),
                   static_cast<unsigned long>(NeoKeyConfig::DEBOUNCE_MS));
-    Serial.printf("[LED] Startup running light: keys=1..%u color=green step=100 ms\n",
-                  NeoKeyConfig::KEY_COUNT);
     KeyLighting::begin();
     Serial.printf("[LED] Key lighting ready: pixels=%u data=GPIO%u brightness=%u background=%u hold=%lu ms fade=%lu ms\n",
                   NeoPixelConfig::PIXEL_COUNT,
@@ -514,6 +586,11 @@ void loop()
         Serial.printf("[SMARTSDR] State: %s -> %s\n",
                       radioStateName(previousRadioState),
                       radioStateName(radioState));
+        if (radioState == SmartSdrConnection::State::Connected)
+        {
+            KeyLighting::startRadioConnectedAnimation(millis());
+            Serial.println("[LED] Radio connected animation: left column keys=12,9,6,3 color=green step=100 ms");
+        }
         previousRadioState = radioState;
         if (radioState == SmartSdrConnection::State::RadioFound ||
             radioState == SmartSdrConnection::State::Connecting ||
@@ -541,6 +618,16 @@ void loop()
     }
     previousRfPowerAvailable = rfPowerAvailable;
     previousRfPower = rfPower;
+
+    updateRfPowerRequest();
+
+    uint64_t activeFrequencyHz = 0;
+    if (radioState != SmartSdrConnection::State::Ready ||
+        !SmartSdrConnection::activeSliceFrequencyHz(activeFrequencyHz) ||
+        ButtonConfig::isSixMeterFrequency(activeFrequencyHz))
+    {
+        KeyLighting::clearBlinkingKey();
+    }
 
     updateHeartbeat();
     NeoKey::update();

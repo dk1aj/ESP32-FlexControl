@@ -12,7 +12,7 @@ namespace
 constexpr char PREFERENCES_NAMESPACE[] = "flexwifi";
 constexpr char SSID_KEY[] = "ssid";
 constexpr char PASSWORD_KEY[] = "password";
-constexpr char SETUP_AP_NAME[] = "ESP32-FlexRadio-Setup";
+constexpr char SETUP_AP_NAME[] = "ESP32-Radio-Setup";
 constexpr uint32_t WIFI_CONNECT_TIMEOUT_MS = 20000;
 constexpr uint32_t RESTART_DELAY_MS = 1500;
 constexpr uint16_t DNS_PORT = 53;
@@ -33,11 +33,11 @@ String configurationPage()
     return F(
         "<!doctype html><html lang='de'><head>"
         "<meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
-        "<title>FlexRadio WLAN</title><style>"
+        "<title>Radio WLAN</title><style>"
         "body{font-family:sans-serif;max-width:34rem;margin:2rem auto;padding:0 1rem}"
         "label{display:block;margin-top:1rem}input{box-sizing:border-box;width:100%;padding:.7rem}"
         "button{margin-top:1.2rem;padding:.8rem 1.2rem}</style></head><body>"
-        "<h1>FlexRadio WLAN</h1>"
+        "<h1>Radio WLAN</h1>"
         "<p>WLAN-Zugangsdaten eingeben. Das Geraet startet danach neu.</p>"
         "<form method='post' action='/save'>"
         "<label>WLAN-Name (SSID)<input name='ssid' maxlength='32' required></label>"

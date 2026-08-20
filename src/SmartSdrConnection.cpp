@@ -15,6 +15,7 @@ constexpr uint32_t CONNECT_RETRY_MS = 4000;
 constexpr uint32_t TCP_CONNECT_TIMEOUT_MS = 300;
 constexpr uint32_t PING_INTERVAL_MS = 1000;
 constexpr uint32_t RX_TIMEOUT_MS = 20000;
+constexpr uint32_t RF_POWER_CONFIRM_TIMEOUT_MS = 3000;
 constexpr size_t DISCOVERY_BUFFER_SIZE = 512;
 constexpr size_t LINE_BUFFER_SIZE = 2048;
 constexpr uint8_t MAX_TRACKED_SLICES = 8;
@@ -25,6 +26,17 @@ struct SliceState
     bool active = false;
     bool frequencyAvailable = false;
     uint64_t frequencyHz = 0;
+};
+
+struct RfPowerRequest
+{
+    SmartSdrConnection::RfPowerRequestState state =
+        SmartSdrConnection::RfPowerRequestState::Idle;
+    uint32_t sequence = 0;
+    uint32_t startedMs = 0;
+    uint8_t requestedPercent = 0;
+    bool responseReceived = false;
+    bool statusConfirmed = false;
 };
 
 WiFiUDP discoveryUdp;
@@ -47,6 +59,33 @@ uint32_t nextSequence = 1;
 char lineBuffer[LINE_BUFFER_SIZE] = {};
 size_t lineLength = 0;
 SliceState slices[MAX_TRACKED_SLICES] = {};
+RfPowerRequest rfPowerRequest;
+
+void failRfPowerRequest(const char *reason)
+{
+    if (rfPowerRequest.state !=
+        SmartSdrConnection::RfPowerRequestState::Pending)
+    {
+        return;
+    }
+
+    rfPowerRequest.state = SmartSdrConnection::RfPowerRequestState::Failed;
+    Serial.printf("[RF POWER] Request failed: %s\n", reason);
+}
+
+void completeRfPowerRequestIfConfirmed()
+{
+    if (rfPowerRequest.state ==
+            SmartSdrConnection::RfPowerRequestState::Pending &&
+        rfPowerRequest.responseReceived &&
+        rfPowerRequest.statusConfirmed)
+    {
+        rfPowerRequest.state =
+            SmartSdrConnection::RfPowerRequestState::Confirmed;
+        Serial.printf("[RF POWER] Confirmed: %u%%\n",
+                      rfPowerRequest.requestedPercent);
+    }
+}
 
 void resetSlices()
 {
@@ -86,7 +125,7 @@ void selectConfiguredRadioFallback()
     discoveredRadioIp = configuredRadioIp();
     discoveredRadioPort = RadioConfig::STATIC_API_PORT;
     discoveredRadioModel = "configured target";
-    discoveredRadioName = "AU-510M static fallback";
+    discoveredRadioName = "Radio static fallback";
     discoveredRadioSerial = "";
     currentState = SmartSdrConnection::State::RadioFound;
     lastConnectAttemptMs = 0;
@@ -215,11 +254,11 @@ void processDiscovery()
     }
 }
 
-void sendCommand(const char *command)
+uint32_t sendCommand(const char *command)
 {
     if (!apiClient.connected())
     {
-        return;
+        return 0;
     }
     const uint32_t sequence = nextSequence++;
     apiClient.printf("C%lu|%s\n",
@@ -228,6 +267,7 @@ void sendCommand(const char *command)
     Serial.printf("[SMARTSDR TX] C%lu|%s\n",
                   static_cast<unsigned long>(sequence),
                   command);
+    return sequence;
 }
 
 void startApiSession()
@@ -240,7 +280,8 @@ void startApiSession()
     nextSequence = 1;
     lastReceiveMs = millis();
     lastPingMs = millis();
-    sendCommand("client program ESP32_Handwheel");
+    sendCommand("name ESP32_Handwheel");
+    sendCommand("info");
     sendCommand("sub tx all");
     sendCommand("sub slice all");
     sendCommand("keepalive enable");
@@ -423,9 +464,92 @@ int activeSliceNumber()
     return usableSliceCount == 1 ? onlyUsableSlice : -1;
 }
 
+int exactlyOneActiveSliceNumber()
+{
+    int selectedSlice = -1;
+    uint8_t activeSliceCount = 0;
+
+    for (uint8_t index = 0; index < MAX_TRACKED_SLICES; ++index)
+    {
+        const SliceState &slice = slices[index];
+        if (slice.inUse && slice.active && slice.frequencyAvailable)
+        {
+            selectedSlice = index;
+            ++activeSliceCount;
+        }
+    }
+    return activeSliceCount == 1 ? selectedSlice : -1;
+}
+
+bool parseResponse(const char *line,
+                   uint32_t &sequence,
+                   uint32_t &responseCode)
+{
+    if (line[0] != 'R')
+    {
+        return false;
+    }
+
+    char *sequenceEnd = nullptr;
+    const unsigned long parsedSequence = strtoul(line + 1, &sequenceEnd, 10);
+    if (sequenceEnd == line + 1 || *sequenceEnd != '|')
+    {
+        return false;
+    }
+
+    const char *responseStart = sequenceEnd + 1;
+    char *responseEnd = nullptr;
+    const unsigned long parsedResponse =
+        strtoul(responseStart, &responseEnd, 16);
+    if (responseEnd == responseStart ||
+        (*responseEnd != '|' && *responseEnd != '\0'))
+    {
+        return false;
+    }
+
+    sequence = static_cast<uint32_t>(parsedSequence);
+    responseCode = static_cast<uint32_t>(parsedResponse);
+    return true;
+}
+
+void processRfPowerResponse(const uint32_t sequence,
+                            const uint32_t responseCode)
+{
+    if (rfPowerRequest.state !=
+            SmartSdrConnection::RfPowerRequestState::Pending ||
+        sequence != rfPowerRequest.sequence)
+    {
+        return;
+    }
+
+    if (responseCode != 0)
+    {
+        Serial.printf("[RF POWER] Radio rejected sequence %lu: code=%08lX\n",
+                      static_cast<unsigned long>(sequence),
+                      static_cast<unsigned long>(responseCode));
+        failRfPowerRequest("Radio rejected command");
+        return;
+    }
+
+    rfPowerRequest.responseReceived = true;
+    Serial.printf("[RF POWER] Command accepted: sequence=%lu requested=%u%%\n",
+                  static_cast<unsigned long>(sequence),
+                  rfPowerRequest.requestedPercent);
+    completeRfPowerRequestIfConfirmed();
+}
+
 void processApiLine(char *line)
 {
     Serial.printf("[SMARTSDR RX] %s\n", line);
+
+    uint32_t responseSequence = 0;
+    uint32_t responseCode = 0;
+    if (parseResponse(line, responseSequence, responseCode))
+    {
+        processRfPowerResponse(responseSequence, responseCode);
+        return;
+    }
+
     const char *payload = strchr(line, '|');
     if (payload == nullptr)
     {
@@ -454,6 +578,13 @@ void processApiLine(char *line)
         currentRfPower = value;
         rfPowerAvailable = true;
         currentState = SmartSdrConnection::State::Ready;
+        if (rfPowerRequest.state ==
+                SmartSdrConnection::RfPowerRequestState::Pending &&
+            value == rfPowerRequest.requestedPercent)
+        {
+            rfPowerRequest.statusConfirmed = true;
+            completeRfPowerRequestIfConfirmed();
+        }
     }
 }
 
@@ -491,6 +622,7 @@ void updateApiConnection()
 {
     if (!apiClient.connected())
     {
+        failRfPowerRequest("TCP connection lost");
         Serial.println("[SMARTSDR] TCP connection lost; retry scheduled");
         apiClient.stop();
         rfPowerAvailable = false;
@@ -510,10 +642,18 @@ void updateApiConnection()
     {
         Serial.printf("[SMARTSDR] RX timeout after %lu ms; closing TCP\n",
                       static_cast<unsigned long>(RX_TIMEOUT_MS));
+        failRfPowerRequest("receive timeout");
         apiClient.stop();
         rfPowerAvailable = false;
         currentState = SmartSdrConnection::State::RadioFound;
         lastConnectAttemptMs = nowMs;
+    }
+
+    if (rfPowerRequest.state ==
+            SmartSdrConnection::RfPowerRequestState::Pending &&
+        nowMs - rfPowerRequest.startedMs >= RF_POWER_CONFIRM_TIMEOUT_MS)
+    {
+        failRfPowerRequest("confirmation timeout");
     }
 }
 } // namespace
@@ -526,6 +666,7 @@ void begin()
     discoveryUdp.stop();
     discoveryStarted = false;
     discoveryFailureLogged = false;
+    rfPowerRequest = RfPowerRequest{};
     resetRadioState();
 }
 
@@ -541,6 +682,7 @@ void update()
         if (currentState != State::Idle)
         {
             Serial.println("[SMARTSDR] WiFi unavailable; radio state cleared");
+            failRfPowerRequest("WiFi unavailable");
             resetRadioState();
         }
         return;
@@ -607,6 +749,90 @@ bool hasRfPower()
 uint16_t rfPowerSetting()
 {
     return currentRfPower;
+}
+
+bool activeSliceFrequencyHz(uint64_t &frequencyHz)
+{
+    const int sliceNumber = activeSliceNumber();
+    if (sliceNumber < 0)
+    {
+        return false;
+    }
+
+    frequencyHz = slices[sliceNumber].frequencyHz;
+    return true;
+}
+
+bool requestRfPowerPercent(const uint8_t percent)
+{
+    if (rfPowerRequest.state != RfPowerRequestState::Idle)
+    {
+        Serial.println("[RF POWER] Request skipped: another request is active");
+        return false;
+    }
+    if (percent > 100)
+    {
+        Serial.println("[RF POWER] Request skipped: percentage is out of range");
+        return false;
+    }
+    if (!apiClient.connected() || currentState != State::Ready)
+    {
+        Serial.println("[RF POWER] Request skipped: Radio is not ready");
+        return false;
+    }
+
+    const int sliceNumber = exactlyOneActiveSliceNumber();
+    if (sliceNumber < 0)
+    {
+        Serial.println("[RF POWER] Request skipped: not exactly one active slice");
+        return false;
+    }
+
+    const uint64_t frequencyHz = slices[sliceNumber].frequencyHz;
+    if (frequencyHz >= 50000000ULL && frequencyHz <= 54000000ULL)
+    {
+        Serial.println("[RF POWER] Request skipped: power keys are disabled on 6 m");
+        return false;
+    }
+
+    char command[48] = {};
+    snprintf(command,
+             sizeof(command),
+             "transmit set rfpower=%u",
+             static_cast<unsigned>(percent));
+
+    rfPowerRequest = RfPowerRequest{};
+    rfPowerRequest.state = RfPowerRequestState::Pending;
+    rfPowerRequest.startedMs = millis();
+    rfPowerRequest.requestedPercent = percent;
+    rfPowerRequest.statusConfirmed =
+        rfPowerAvailable && currentRfPower == percent;
+    rfPowerRequest.sequence = sendCommand(command);
+    if (rfPowerRequest.sequence == 0)
+    {
+        failRfPowerRequest("TCP write unavailable");
+        return false;
+    }
+
+    Serial.printf("[RF POWER] Request pending: sequence=%lu requested=%u%% slice=%d\n",
+                  static_cast<unsigned long>(rfPowerRequest.sequence),
+                  percent,
+                  sliceNumber);
+    return true;
+}
+
+RfPowerRequestState rfPowerRequestState()
+{
+    return rfPowerRequest.state;
+}
+
+void clearRfPowerRequestResult()
+{
+    if (rfPowerRequest.state == RfPowerRequestState::Pending)
+    {
+        return;
+    }
+    rfPowerRequest = RfPowerRequest{};
 }
 
 bool tuneActiveSliceByHz(const int64_t deltaHz)

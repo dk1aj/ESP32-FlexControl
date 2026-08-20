@@ -43,6 +43,10 @@ constexpr uint32_t GREEN_FLASH_MS = 250;
 constexpr uint32_t HOLD_THRESHOLD_MS = 700;
 constexpr uint32_t HOLD_BLINK_INTERVAL_MS = 250;
 constexpr uint32_t RELEASE_FADE_MS = 450;
+constexpr uint32_t ACTIVE_KEY_BLINK_INTERVAL_MS = 400;
+constexpr uint32_t ACTIVE_KEY_BLINK_DURATION_MS = 5000;
+constexpr uint8_t ACTIVE_KEY_BLINK_BLUE_LEVEL = 38; // Rounded 15% of 255.
+constexpr uint8_t ACTIVE_KEY_STEADY_BLUE_LEVEL = 26; // Rounded 10% of 255.
 
 static_assert(PIXEL_COUNT > 0, "At least one NeoPixel is required");
 static_assert(sizeof(KEY_PIXEL_MAP) / sizeof(KEY_PIXEL_MAP[0]) ==
@@ -61,4 +65,8 @@ static_assert(HOLD_BLINK_INTERVAL_MS > 0,
               "The hold blink interval must be positive");
 static_assert(RELEASE_FADE_MS > 0,
               "The release fade duration must be positive");
+static_assert(ACTIVE_KEY_BLINK_INTERVAL_MS > 0,
+              "The active-key blink interval must be positive");
+static_assert(ACTIVE_KEY_BLINK_DURATION_MS > 0,
+              "The active-key blink duration must be positive");
 } // namespace NeoPixelConfig
