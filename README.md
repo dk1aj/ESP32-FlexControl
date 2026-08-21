@@ -1,8 +1,9 @@
 # ESP32-S3 Radio Handwheel Controller
 
 This project is firmware for an ESP32-S3 handwheel controller with an
-Adafruit NeoKey Snap 3x4 keypad. It connects directly to one Radio through the
-SmartSDR TCP/IP API. It does not need FRStack or a PC during normal operation.
+Adafruit NeoKey Snap 3x4 keypad. It connects directly to a radio (FlexRadio)
+that supports the SmartSDR TCP/IP API. It does not need FRStack or a PC during
+normal operation.
 
 The current controls are implemented in the firmware. The verified hardware
 state is listed at the end of this README.
