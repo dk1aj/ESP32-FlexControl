@@ -7,6 +7,12 @@ SmartSDR TCP/IP API. It does not need FRStack or a PC during normal operation.
 The current controls are implemented in the firmware. The verified hardware
 state is listed at the end of this README.
 
+<p align="center">
+  <img src="DOKU/handwheel-product-render.png" alt="ESP32-S3 Radio Handwheel Controller in studio lighting" width="520">
+</p>
+
+<p align="center"><em>Product rendering of the handwheel controller enclosure.</em></p>
+
 ## Main features
 
 - Hardware quadrature encoder using the ESP32-S3 PCNT peripheral
@@ -46,6 +52,14 @@ ROW2      9     8     7
 ROW3      6     5     4
 ROW4      3     2     1
 ```
+
+### Visual control overview
+
+![Control overview of all keys and the handwheel](DOKU/handwheel-control-overview.png)
+
+### Technical concept sketch
+
+![Technical concept sketch of the enclosure and controls](DOKU/handwheel-control-sketch.png)
 
 ## Controls
 
