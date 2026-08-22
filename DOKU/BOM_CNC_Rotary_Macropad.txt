@@ -1,0 +1,103 @@
+CNC ROTARY MACROPAD - BILL OF MATERIALS (BOM)
+================================================
+
+POS-001 | 1x ESP32-S3 WROOM-1-N16R8 ESP32-S3-DevKitC-1
+  Board name: ESP32-S3 WROOM-1-N16R8 ESP32-S3-DevKitC-1
+  Module: ESP32-S3-WROOM-1-N16R8
+  Memory: 16 MB QSPI flash, 8 MB OPI PSRAM
+  Amazon ASIN: B0FYFF8CB2
+    https://www.amazon.de/dp/B0FYFF8CB2
+  Alternative suppliers:
+  Makeroo:
+    https://makeroo.de/products/esp32-s3-n16r8-dev-kit-dual-usb-c-16mb-flash-8mb-psram-ai-optimiert-wifi-bluetooth-microcontroller
+  HESTORE: ESP32-S3-DEV-N16R8
+    https://www.hestore.eu/de/prod_10048179.html
+  Waveshare compatible version: manufacturer part number 28409
+    https://www.waveshare.com/esp32-s3-dev-kit-n8r8.htm?sku=28409
+
+POS-002 | 1x NeoKey 5x6 Ortho Snap-Apart PCB
+  Use: split into one 3x4 section with 12 keys
+  Manufacturer part number: Adafruit 5157
+  Amazon ASIN: B0DXD7XCKB
+    https://www.amazon.de/dp/B0DXD7XCKB
+  Alternative suppliers:
+  Adafruit:
+    https://www.adafruit.com/product/5157
+  BerryBase: ADA5157
+    https://www.berrybase.de/neokey-5x6-ortho-snap-apart-mechanischen-tasten-mit-neopixel-led-s
+  Mouser: 485-5157
+    https://www.mouser.de/ProductDetail/Adafruit/5157
+  DigiKey: 1528-5157-ND
+    https://www.digikey.de/de/products/detail/adafruit-industries-llc/5157/14652782
+
+POS-003 | 1x CNC rotary encoder, 60 mm, silver, 100 pulses per revolution
+  Manufacturer part number: Adafruit 5735
+  Adafruit:
+    https://www.adafruit.com/product/5735
+  Botland:
+    https://botland.de/encoder/23547-cnc-inkrementalgeber-100-impulse-pro-umdrehung-60mm-durchmesser-silber-adafruit-5735.html
+  Mouser: 485-5735
+    https://www.mouser.de/ProductDetail/Adafruit/5735
+  DigiKey: 1528-5735-ND
+    https://www.digikey.de/de/products/detail/adafruit-industries-llc/5735/21839774
+
+POS-004 | 12x mechanical key switches
+  Type: Kailh Linear Black, MX compatible
+  Manufacturer part number: Adafruit 5876
+  Adafruit:
+    https://www.adafruit.com/product/5876
+  Mouser: 485-5876
+    https://www.mouser.de/ProductDetail/Adafruit/5876
+  DigiKey: 1528-5876-ND
+    https://www.digikey.de/de/products/detail/adafruit-industries-llc/5876/22596399
+  Alternative: standard MX-compatible switches, not low-profile switches.
+
+POS-005 | 12x keycaps
+  Type: clear, DSA, 1u, MX cross mount
+  Manufacturer part number: Adafruit 5068
+  Adafruit:
+    https://www.adafruit.com/product/5068
+  Mouser: 485-5068
+    https://www.mouser.de/ProductDetail/Adafruit/5068
+  DigiKey: 1528-5068-ND
+    https://www.digikey.de/de/products/detail/adafruit-industries-llc/5068/14617348
+  Alternative: 1u keycaps with an MX cross mount.
+
+POS-006 | 1x USB-A to USB-C data cable, approximately 1 m
+  Manufacturer part number: Adafruit 5153
+  Adafruit:
+    https://www.adafruit.com/product/5153
+  Mouser: 485-5153
+    https://www.mouser.de/ProductDetail/Adafruit/5153
+  Reichelt: EFB USBCUSB20AK1
+  Manufacturer part number: EBUSBC-USB20AK.1
+    https://www.reichelt.de/de/de/shop/produkt/usb_2_0_kabel_a_stecker_auf_c_stecker_1_0_m-330172
+
+POS-007 | 12x M2.5 x 6 mm pan-head machine screws
+  Standard: ISO 7045 / DIN 7985
+  Buerklin: 16H2840
+  Manufacturer part number: Ettinger 001.17.221
+    https://www.buerklin.com/de/p/ettinger/schrauben-gewindestangen/001-17-221/16H2840/
+  RS Components: 560-552
+    https://de.rs-online.com/
+  Alternative: ISO 7045 M2.5 x 6 screws from a fastener supplier.
+
+POS-008 | 3x hex nuts for the CNC rotary encoder
+  Included with POS-003; no separate purchase is required.
+
+POS-009 | 1x pack of 4 self-adhesive rubber feet
+  Manufacturer part number: Adafruit 550
+  Adafruit:
+    https://www.adafruit.com/product/550
+  Mouser: 485-550
+    https://www.mouser.de/ProductDetail/Adafruit/550
+  DigiKey: 1528-550-ND
+    https://www.digikey.de/de/products/detail/adafruit-industries-llc/550/26735448
+  Alternative: 4x self-adhesive enclosure feet, approximately 8 x 4 mm.
+
+POS-010 | 1x 3D-printed top cover
+POS-011 | 1x 3D-printed frame
+POS-012 | 1x 3D-printed bottom cover for the ESP32-S3 board
+POS-013 | 1x 3D-printed NeoKey PCB mount
+  Material: PLA
+  Source: print locally or use a 3D-printing service.
