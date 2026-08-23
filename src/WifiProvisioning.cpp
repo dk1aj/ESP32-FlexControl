@@ -26,6 +26,7 @@ uint32_t connectionStartedMs = 0;
 uint32_t restartRequestedMs = 0;
 bool restartRequested = false;
 bool portalHandlersConfigured = false;
+bool stationConnectedOnce = false;
 uint32_t stationAttempt = 0;
 
 String configurationPage()
@@ -194,6 +195,7 @@ void begin()
 {
     Serial.println("[WIFI] Provisioning service initializing");
     restartRequested = false;
+    stationConnectedOnce = false;
     stationAttempt = 0;
     currentState = State::Idle;
     if (loadLocalCredentials() || loadStoredCredentials())
@@ -223,6 +225,7 @@ void update()
 
     if (WiFi.status() == WL_CONNECTED)
     {
+        stationConnectedOnce = true;
         currentState = State::Connected;
         return;
     }
@@ -238,9 +241,22 @@ void update()
     if (currentState == State::Connecting &&
         millis() - connectionStartedMs >= WIFI_CONNECT_TIMEOUT_MS)
     {
-        Serial.printf("[WIFI] Connection timeout after %lu ms\n",
-                      static_cast<unsigned long>(WIFI_CONNECT_TIMEOUT_MS));
-        startPortal();
+        if (!stationConnectedOnce)
+        {
+            Serial.printf("[WIFI] Initial connection timeout after %lu ms\n",
+                          static_cast<unsigned long>(WIFI_CONNECT_TIMEOUT_MS));
+            startPortal();
+            return;
+        }
+
+        ++stationAttempt;
+        Serial.printf("[WIFI] Reconnect timeout after %lu ms; attempt %lu\n",
+                      static_cast<unsigned long>(WIFI_CONNECT_TIMEOUT_MS),
+                      static_cast<unsigned long>(stationAttempt));
+        const bool reconnectStarted = WiFi.reconnect();
+        Serial.printf("[WIFI] Station reconnect request: %s\n",
+                      reconnectStarted ? "accepted" : "not accepted");
+        connectionStartedMs = millis();
     }
 }
 

@@ -43,15 +43,7 @@ constexpr uint8_t FREQUENCY_STEP_100_HZ_INDEX = 5;
 constexpr uint32_t DOUBLE_CLICK_WINDOW_MS = 350;
 constexpr uint32_t LONG_PRESS_MS = 700;
 
-// Radio rfpower is a percentage. Watt values are labels matching the existing
-// Stream Deck setup for the 500 W HF maximum and are never sent to the Radio.
-constexpr uint16_t DEFAULT_RF_POWER_WATTS[NeoKeyConfig::KEY_COUNT] = {
-    0, 0, 0,
-    10, 20, 50,
-    100, 200, 300,
-    400, 450, 0
-};
-
+// SmartSDR rfpower uses fixed percentage values.
 constexpr uint8_t DEFAULT_RF_POWER_PERCENT[NeoKeyConfig::KEY_COUNT] = {
     0, 0, 0,
     2, 4, 10,
@@ -61,13 +53,6 @@ constexpr uint8_t DEFAULT_RF_POWER_PERCENT[NeoKeyConfig::KEY_COUNT] = {
 
 constexpr uint64_t SIX_METER_MIN_HZ = 50000000ULL;
 constexpr uint64_t SIX_METER_MAX_HZ = 54000000ULL;
-
-constexpr uint16_t defaultRfPowerWatts(const uint8_t key)
-{
-    return key >= 1 && key <= NeoKeyConfig::KEY_COUNT
-               ? DEFAULT_RF_POWER_WATTS[key - 1]
-               : 0;
-}
 
 constexpr Action action(const uint8_t key)
 {
@@ -81,6 +66,20 @@ constexpr uint8_t defaultRfPowerPercent(const uint8_t key)
     return key >= 1 && key <= NeoKeyConfig::KEY_COUNT
                ? DEFAULT_RF_POWER_PERCENT[key - 1]
                : 0;
+}
+
+inline uint8_t rfPowerKeyForPercent(const uint16_t percent)
+{
+    for (uint8_t key = 1; key <= NeoKeyConfig::KEY_COUNT; ++key)
+    {
+        if (action(key) == Action::RfPowerPreset &&
+            defaultRfPowerPercent(key) == percent)
+        {
+            return key;
+        }
+    }
+
+    return 0;
 }
 
 constexpr bool isSixMeterFrequency(const uint64_t frequencyHz)
@@ -104,10 +103,6 @@ static_assert(FREQUENCY_STEPS_HZ[FREQUENCY_STEP_50_HZ_INDEX] == 50,
 static_assert(FREQUENCY_STEPS_HZ[FREQUENCY_STEP_100_HZ_INDEX] == 100,
               "The long-press frequency step must be 100 Hz");
 
-static_assert(sizeof(DEFAULT_RF_POWER_WATTS) /
-                      sizeof(DEFAULT_RF_POWER_WATTS[0]) ==
-                  NeoKeyConfig::KEY_COUNT,
-              "Each NeoKey button must have one RF-power preset");
 static_assert(sizeof(DEFAULT_RF_POWER_PERCENT) /
                       sizeof(DEFAULT_RF_POWER_PERCENT[0]) ==
                   NeoKeyConfig::KEY_COUNT,

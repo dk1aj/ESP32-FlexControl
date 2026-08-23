@@ -1,4 +1,6 @@
 #include "SmartSdrConnection.h"
+#include "SmartSdrLineParser.h"
+#include "SmartSdrProtocolParser.h"
 
 #include <WiFi.h>
 #include <WiFiClient.h>
@@ -16,16 +18,72 @@ constexpr uint32_t TCP_CONNECT_TIMEOUT_MS = 300;
 constexpr uint32_t PING_INTERVAL_MS = 1000;
 constexpr uint32_t RX_TIMEOUT_MS = 20000;
 constexpr uint32_t RF_POWER_CONFIRM_TIMEOUT_MS = 3000;
+constexpr uint32_t COMMAND_RESPONSE_TIMEOUT_MS = 3000;
 constexpr size_t DISCOVERY_BUFFER_SIZE = 512;
 constexpr size_t LINE_BUFFER_SIZE = 2048;
+constexpr size_t COMMAND_BUFFER_SIZE = 160;
 constexpr uint8_t MAX_TRACKED_SLICES = 8;
+constexpr uint8_t MAX_TRACKED_CLIENTS = 8;
+constexpr uint8_t MAX_PENDING_COMMANDS = 32;
+constexpr size_t CLIENT_ID_SIZE = 37;
+constexpr const char *INITIAL_SESSION_COMMANDS[] = {
+    "name ESP32_Handwheel",
+    "info",
+    "sub client all",
+    "sub slice all",
+    "keepalive enable"};
+constexpr uint8_t INITIAL_SESSION_COMMAND_COUNT =
+    sizeof(INITIAL_SESSION_COMMANDS) /
+    sizeof(INITIAL_SESSION_COMMANDS[0]);
+constexpr uint8_t REQUIRED_SESSION_COMMAND_COUNT =
+    INITIAL_SESSION_COMMAND_COUNT + 2;
+
+using ApiLineParser = SmartSdrLineParser<LINE_BUFFER_SIZE>;
+
+enum class CommandType : uint8_t
+{
+    Session,
+    ClientBind,
+    TxSubscription,
+    Keepalive,
+    Tuning,
+    OperatorMessage,
+    FrequencyStepSpot,
+    RfPower
+};
+
+enum class ResponseClass : uint8_t
+{
+    Success,
+    Informational,
+    Error
+};
+
+struct CommandLedgerEntry
+{
+    bool inUse = false;
+    uint32_t sequence = 0;
+    CommandType type = CommandType::Session;
+    uint32_t sentMs = 0;
+};
 
 struct SliceState
 {
     bool inUse = false;
     bool active = false;
     bool frequencyAvailable = false;
+    bool clientHandleAvailable = false;
     uint64_t frequencyHz = 0;
+    uint64_t reportedFrequencyHz = 0;
+    uint32_t clientHandle = 0;
+    uint32_t latestTuningSequence = 0;
+};
+
+struct ClientState
+{
+    bool inUse = false;
+    uint32_t handle = 0;
+    char clientId[CLIENT_ID_SIZE] = {};
 };
 
 struct RfPowerRequest
@@ -34,6 +92,7 @@ struct RfPowerRequest
         SmartSdrConnection::RfPowerRequestState::Idle;
     uint32_t sequence = 0;
     uint32_t startedMs = 0;
+    uint32_t statusGenerationAtStart = 0;
     uint8_t requestedPercent = 0;
     bool responseReceived = false;
     bool statusConfirmed = false;
@@ -49,6 +108,9 @@ String discoveredRadioName;
 String discoveredRadioSerial;
 uint16_t currentRfPower = 0;
 bool rfPowerAvailable = false;
+uint16_t confirmedRfPower = 0;
+bool confirmedRfPowerAvailable = false;
+uint32_t rfPowerStatusGeneration = 0;
 bool discoveryStarted = false;
 bool discoveryFailureLogged = false;
 uint32_t discoveryPhaseStartedMs = 0;
@@ -56,10 +118,21 @@ uint32_t lastConnectAttemptMs = 0;
 uint32_t lastPingMs = 0;
 uint32_t lastReceiveMs = 0;
 uint32_t nextSequence = 1;
-char lineBuffer[LINE_BUFFER_SIZE] = {};
-size_t lineLength = 0;
+ApiLineParser apiLineParser;
 SliceState slices[MAX_TRACKED_SLICES] = {};
+ClientState clients[MAX_TRACKED_CLIENTS] = {};
 RfPowerRequest rfPowerRequest;
+CommandLedgerEntry commandLedger[MAX_PENDING_COMMANDS] = {};
+uint8_t acceptedSessionCommandCount = 0;
+bool freshTransmitterStatusReceived = false;
+bool clientBindAccepted = false;
+bool txSubscriptionAccepted = false;
+uint32_t targetClientHandle = 0;
+uint32_t boundClientHandle = 0;
+uint32_t clientBindSequence = 0;
+uint32_t txSubscriptionSequence = 0;
+
+void invalidateClientBinding(const char *reason);
 
 void failRfPowerRequest(const char *reason)
 {
@@ -80,11 +153,45 @@ void completeRfPowerRequestIfConfirmed()
         rfPowerRequest.responseReceived &&
         rfPowerRequest.statusConfirmed)
     {
+        confirmedRfPower = rfPowerRequest.requestedPercent;
+        confirmedRfPowerAvailable = true;
         rfPowerRequest.state =
             SmartSdrConnection::RfPowerRequestState::Confirmed;
         Serial.printf("[RF POWER] Confirmed: %u%%\n",
                       rfPowerRequest.requestedPercent);
     }
+}
+
+void resetSessionReadiness()
+{
+    acceptedSessionCommandCount = 0;
+    freshTransmitterStatusReceived = false;
+    clientBindAccepted = false;
+    txSubscriptionAccepted = false;
+    targetClientHandle = 0;
+    boundClientHandle = 0;
+    clientBindSequence = 0;
+    txSubscriptionSequence = 0;
+}
+
+void updateSessionReadiness()
+{
+    const uint8_t acceptedCommandCount =
+        acceptedSessionCommandCount +
+        (clientBindAccepted ? 1U : 0U) +
+        (txSubscriptionAccepted ? 1U : 0U);
+    if (currentState != SmartSdrConnection::State::Connected ||
+        acceptedCommandCount != REQUIRED_SESSION_COMMAND_COUNT ||
+        !freshTransmitterStatusReceived)
+    {
+        return;
+    }
+
+    currentState = SmartSdrConnection::State::Ready;
+    Serial.printf("[SMARTSDR] Session ready: commands=%u/%u fresh-rfpower=yes bound-client=0x%08lX\n",
+                  acceptedCommandCount,
+                  REQUIRED_SESSION_COMMAND_COUNT,
+                  static_cast<unsigned long>(boundClientHandle));
 }
 
 void resetSlices()
@@ -95,6 +202,156 @@ void resetSlices()
     }
 }
 
+void resetClients()
+{
+    for (ClientState &client : clients)
+    {
+        client = ClientState{};
+    }
+}
+
+
+const char *commandTypeName(const CommandType type)
+{
+    switch (type)
+    {
+    case CommandType::Session:
+        return "session";
+    case CommandType::ClientBind:
+        return "client-bind";
+    case CommandType::TxSubscription:
+        return "tx-subscription";
+    case CommandType::Keepalive:
+        return "keepalive";
+    case CommandType::Tuning:
+        return "tuning";
+    case CommandType::OperatorMessage:
+        return "operator-message";
+    case CommandType::FrequencyStepSpot:
+        return "frequency-step-spot";
+    case CommandType::RfPower:
+        return "rf-power";
+    }
+    return "unknown";
+}
+
+ResponseClass classifyResponseCode(const uint32_t responseCode)
+{
+    if (responseCode == 0)
+    {
+        return ResponseClass::Success;
+    }
+    if ((responseCode & 0xF0000000UL) == 0x10000000UL)
+    {
+        return ResponseClass::Informational;
+    }
+    return ResponseClass::Error;
+}
+
+const char *responseClassName(const ResponseClass responseClass)
+{
+    switch (responseClass)
+    {
+    case ResponseClass::Success:
+        return "success";
+    case ResponseClass::Informational:
+        return "informational";
+    case ResponseClass::Error:
+        return "error";
+    }
+    return "unknown";
+}
+
+void clearCommandLedger()
+{
+    for (CommandLedgerEntry &entry : commandLedger)
+    {
+        entry = CommandLedgerEntry{};
+    }
+}
+
+CommandLedgerEntry *freeCommandLedgerEntry()
+{
+    for (CommandLedgerEntry &entry : commandLedger)
+    {
+        if (!entry.inUse)
+        {
+            return &entry;
+        }
+    }
+    return nullptr;
+}
+
+bool takeCommandFromLedger(const uint32_t sequence, CommandType &type)
+{
+    for (CommandLedgerEntry &entry : commandLedger)
+    {
+        if (entry.inUse && entry.sequence == sequence)
+        {
+            type = entry.type;
+            entry = CommandLedgerEntry{};
+            return true;
+        }
+    }
+    return false;
+}
+
+void finishTuningCommand(const uint32_t sequence, const bool accepted)
+{
+    for (uint8_t index = 0; index < MAX_TRACKED_SLICES; ++index)
+    {
+        SliceState &slice = slices[index];
+        if (slice.latestTuningSequence != sequence)
+        {
+            continue;
+        }
+
+        slice.latestTuningSequence = 0;
+        if (!accepted)
+        {
+            slice.frequencyHz = slice.reportedFrequencyHz;
+            Serial.printf("[TUNING] Sequence %lu failed; slice=%u resynchronized=%llu.%06llu MHz\n",
+                          static_cast<unsigned long>(sequence),
+                          index,
+                          static_cast<unsigned long long>(
+                              slice.frequencyHz / 1000000ULL),
+                          static_cast<unsigned long long>(
+                              slice.frequencyHz % 1000000ULL));
+        }
+        return;
+    }
+}
+
+void expireCommandLedger(const uint32_t nowMs)
+{
+    for (CommandLedgerEntry &entry : commandLedger)
+    {
+        if (!entry.inUse ||
+            nowMs - entry.sentMs < COMMAND_RESPONSE_TIMEOUT_MS)
+        {
+            continue;
+        }
+
+        Serial.printf("[SMARTSDR] Command response timeout: sequence=%lu type=%s\n",
+                      static_cast<unsigned long>(entry.sequence),
+                      commandTypeName(entry.type));
+        if (entry.type == CommandType::RfPower &&
+            rfPowerRequest.sequence == entry.sequence)
+        {
+            failRfPowerRequest("command response timeout");
+        }
+        else if (entry.type == CommandType::Tuning)
+        {
+            finishTuningCommand(entry.sequence, false);
+        }
+        else if (entry.type == CommandType::ClientBind ||
+                 entry.type == CommandType::TxSubscription)
+        {
+            invalidateClientBinding("client setup response timeout");
+        }
+        entry = CommandLedgerEntry{};
+    }
+}
 void resetRadioState()
 {
     apiClient.stop();
@@ -105,9 +362,16 @@ void resetRadioState()
     discoveredRadioSerial = "";
     rfPowerAvailable = false;
     currentRfPower = 0;
-    lineLength = 0;
+    confirmedRfPower = 0;
+    confirmedRfPowerAvailable = false;
+    rfPowerStatusGeneration = 0;
+    rfPowerRequest = RfPowerRequest{};
+    resetSessionReadiness();
+    apiLineParser.reset();
     nextSequence = 1;
+    clearCommandLedger();
     resetSlices();
+    resetClients();
     discoveryPhaseStartedMs = 0;
     currentState = SmartSdrConnection::State::Idle;
 }
@@ -254,37 +518,270 @@ void processDiscovery()
     }
 }
 
-uint32_t sendCommand(const char *command)
+uint32_t sendCommand(const char *command, const CommandType type)
 {
     if (!apiClient.connected())
     {
         return 0;
     }
-    const uint32_t sequence = nextSequence++;
-    apiClient.printf("C%lu|%s\n",
-                     static_cast<unsigned long>(sequence),
-                     command);
+    CommandLedgerEntry *ledgerEntry = freeCommandLedgerEntry();
+    if (ledgerEntry == nullptr)
+    {
+        Serial.println("[SMARTSDR TX] Command ledger full; not sent");
+        return 0;
+    }
+
+    const uint32_t sequence = nextSequence;
+    char commandLine[COMMAND_BUFFER_SIZE] = {};
+    const int commandLength = snprintf(
+        commandLine,
+        sizeof(commandLine),
+        "C%lu|%s\n",
+        static_cast<unsigned long>(sequence),
+        command);
+    if (commandLength <= 0 ||
+        static_cast<size_t>(commandLength) >= sizeof(commandLine))
+    {
+        Serial.println("[SMARTSDR TX] Command is too long; not sent");
+        return 0;
+    }
+
+    const size_t expectedBytes = static_cast<size_t>(commandLength);
+    const size_t writtenBytes = apiClient.write(
+        reinterpret_cast<const uint8_t *>(commandLine),
+        expectedBytes);
+    if (writtenBytes != expectedBytes)
+    {
+        Serial.printf("[SMARTSDR TX] TCP write failed: wrote %u of %u bytes; reconnect scheduled\n",
+                      static_cast<unsigned>(writtenBytes),
+                      static_cast<unsigned>(expectedBytes));
+        failRfPowerRequest("TCP write failed");
+        clearCommandLedger();
+        apiClient.stop();
+        resetSessionReadiness();
+        rfPowerAvailable = false;
+        currentState = SmartSdrConnection::State::RadioFound;
+        lastConnectAttemptMs = millis();
+        return 0;
+    }
+
+    ++nextSequence;
+    if (nextSequence == 0)
+    {
+        nextSequence = 1;
+    }
+    ledgerEntry->inUse = true;
+    ledgerEntry->sequence = sequence;
+    ledgerEntry->type = type;
+    ledgerEntry->sentMs = millis();
     Serial.printf("[SMARTSDR TX] C%lu|%s\n",
                   static_cast<unsigned long>(sequence),
                   command);
     return sequence;
 }
 
+ClientState *clientForHandle(const uint32_t handle)
+{
+    for (ClientState &client : clients)
+    {
+        if (client.inUse && client.handle == handle)
+        {
+            return &client;
+        }
+    }
+    return nullptr;
+}
+
+ClientState *freeClientState()
+{
+    for (ClientState &client : clients)
+    {
+        if (!client.inUse)
+        {
+            return &client;
+        }
+    }
+    return nullptr;
+}
+
+bool singleActiveSliceClientHandle(uint32_t &clientHandle)
+{
+    uint8_t activeSliceCount = 0;
+    uint32_t selectedHandle = 0;
+    bool selectedHandleAvailable = false;
+    for (const SliceState &slice : slices)
+    {
+        if (!slice.inUse || !slice.active)
+        {
+            continue;
+        }
+        ++activeSliceCount;
+        selectedHandle = slice.clientHandle;
+        selectedHandleAvailable = slice.clientHandleAvailable;
+    }
+
+    if (activeSliceCount != 1 || !selectedHandleAvailable)
+    {
+        return false;
+    }
+    clientHandle = selectedHandle;
+    return true;
+}
+
+void invalidateClientBinding(const char *reason)
+{
+    if (currentState == SmartSdrConnection::State::Ready)
+    {
+        currentState = SmartSdrConnection::State::Connected;
+        Serial.printf("[SMARTSDR] Action readiness cleared: %s\n", reason);
+    }
+    failRfPowerRequest(reason);
+    rfPowerAvailable = false;
+    currentRfPower = 0;
+    confirmedRfPowerAvailable = false;
+    confirmedRfPower = 0;
+    freshTransmitterStatusReceived = false;
+    clientBindAccepted = false;
+    txSubscriptionAccepted = false;
+    targetClientHandle = 0;
+    boundClientHandle = 0;
+    clientBindSequence = 0;
+    txSubscriptionSequence = 0;
+}
+
+void startClientBindingIfPossible()
+{
+    if (!apiClient.connected() ||
+        (currentState != SmartSdrConnection::State::Connected &&
+         currentState != SmartSdrConnection::State::Ready))
+    {
+        return;
+    }
+
+    uint32_t desiredHandle = 0;
+    if (!singleActiveSliceClientHandle(desiredHandle))
+    {
+        if (targetClientHandle != 0 || boundClientHandle != 0)
+        {
+            invalidateClientBinding("active Slice context changed");
+        }
+        return;
+    }
+
+    if (desiredHandle == boundClientHandle &&
+        clientBindAccepted && txSubscriptionAccepted)
+    {
+        return;
+    }
+    if (desiredHandle == targetClientHandle &&
+        (clientBindSequence != 0 || txSubscriptionSequence != 0))
+    {
+        return;
+    }
+
+    ClientState *client = clientForHandle(desiredHandle);
+    if (client == nullptr)
+    {
+        return;
+    }
+
+    if (desiredHandle != targetClientHandle)
+    {
+        invalidateClientBinding("active SmartSDR client changed");
+        targetClientHandle = desiredHandle;
+    }
+
+    char command[80] = {};
+    const int length = snprintf(command,
+                                sizeof(command),
+                                "client bind client_id=%s",
+                                client->clientId);
+    if (length <= 0 || static_cast<size_t>(length) >= sizeof(command))
+    {
+        Serial.println("[SMARTSDR] Client bind command is too long");
+        return;
+    }
+
+    clientBindSequence = sendCommand(command, CommandType::ClientBind);
+    if (clientBindSequence != 0)
+    {
+        Serial.printf("[SMARTSDR] Binding to active SmartSDR client: handle=0x%08lX\n",
+                      static_cast<unsigned long>(desiredHandle));
+    }
+}
+
+void processClientStatus(const char *payload)
+{
+    uint32_t handle = 0;
+    if (!SmartSdrProtocolParser::parseHexField(payload, "client ", handle))
+    {
+        return;
+    }
+
+    ClientState *client = clientForHandle(handle);
+    if (strstr(payload, " disconnected") != nullptr)
+    {
+        if (client != nullptr)
+        {
+            *client = ClientState{};
+        }
+        if (handle == targetClientHandle || handle == boundClientHandle)
+        {
+            invalidateClientBinding("bound SmartSDR client disconnected");
+        }
+        startClientBindingIfPossible();
+        return;
+    }
+
+    char clientId[CLIENT_ID_SIZE] = {};
+    if (!SmartSdrProtocolParser::parseTextField(
+            payload, "client_id=", clientId, sizeof(clientId)))
+    {
+        return;
+    }
+
+    if (client == nullptr)
+    {
+        client = freeClientState();
+    }
+    if (client == nullptr)
+    {
+        Serial.println("[SMARTSDR] Client table full; status ignored");
+        return;
+    }
+
+    client->inUse = true;
+    client->handle = handle;
+    memcpy(client->clientId, clientId, sizeof(client->clientId));
+    Serial.printf("[SMARTSDR] SmartSDR client discovered: handle=0x%08lX\n",
+                  static_cast<unsigned long>(handle));
+    startClientBindingIfPossible();
+}
+
 void startApiSession()
 {
     Serial.println("[SMARTSDR] TCP connected; starting session");
-    lineLength = 0;
+    apiLineParser.reset();
+    resetSessionReadiness();
     rfPowerAvailable = false;
     currentRfPower = 0;
+    confirmedRfPower = 0;
+    confirmedRfPowerAvailable = false;
+    rfPowerStatusGeneration = 0;
+    rfPowerRequest = RfPowerRequest{};
     resetSlices();
+    resetClients();
     nextSequence = 1;
+    clearCommandLedger();
     lastReceiveMs = millis();
     lastPingMs = millis();
-    sendCommand("name ESP32_Handwheel");
-    sendCommand("info");
-    sendCommand("sub tx all");
-    sendCommand("sub slice all");
-    sendCommand("keepalive enable");
+    for (const char *command : INITIAL_SESSION_COMMANDS)
+    {
+        if (sendCommand(command, CommandType::Session) == 0)
+        {
+            return;
+        }
+    }
     currentState = SmartSdrConnection::State::Connected;
 }
 
@@ -317,109 +814,49 @@ void tryApiConnection()
     }
 }
 
-bool parseUnsignedField(const char *line,
-                        const char *field,
-                        uint16_t &value)
-{
-    const char *fieldStart = strstr(line, field);
-    if (fieldStart == nullptr)
-    {
-        return false;
-    }
-    fieldStart += strlen(field);
-    if (*fieldStart < '0' || *fieldStart > '9')
-    {
-        return false;
-    }
-
-    unsigned long parsed = 0;
-    while (*fieldStart >= '0' && *fieldStart <= '9')
-    {
-        parsed = parsed * 10UL + static_cast<unsigned long>(*fieldStart - '0');
-        if (parsed > 65535UL)
-        {
-            return false;
-        }
-        ++fieldStart;
-    }
-    value = static_cast<uint16_t>(parsed);
-    return true;
-}
-
-bool parseSliceNumber(const char *payload, uint8_t &sliceNumber)
-{
-    constexpr char PREFIX[] = "slice ";
-    if (strncmp(payload, PREFIX, sizeof(PREFIX) - 1U) != 0)
-    {
-        return false;
-    }
-
-    const char *numberStart = payload + sizeof(PREFIX) - 1U;
-    char *numberEnd = nullptr;
-    const unsigned long parsed = strtoul(numberStart, &numberEnd, 10);
-    if (numberEnd == numberStart ||
-        (*numberEnd != ' ' && *numberEnd != '\0') ||
-        parsed >= MAX_TRACKED_SLICES)
-    {
-        return false;
-    }
-
-    sliceNumber = static_cast<uint8_t>(parsed);
-    return true;
-}
-
-bool parseFrequencyHz(const char *line, uint64_t &frequencyHz)
-{
-    constexpr char FIELD[] = "RF_frequency=";
-    const char *frequencyStart = strstr(line, FIELD);
-    if (frequencyStart == nullptr)
-    {
-        return false;
-    }
-    frequencyStart += sizeof(FIELD) - 1U;
-
-    char *frequencyEnd = nullptr;
-    const double frequencyMhz = strtod(frequencyStart, &frequencyEnd);
-    if (frequencyEnd == frequencyStart || frequencyMhz <= 0.0)
-    {
-        return false;
-    }
-
-    frequencyHz = static_cast<uint64_t>(frequencyMhz * 1000000.0 + 0.5);
-    return frequencyHz > 0;
-}
-
 void processSliceStatus(const char *payload)
 {
     uint8_t sliceNumber = 0;
-    if (!parseSliceNumber(payload, sliceNumber))
+    if (!SmartSdrProtocolParser::parseSliceNumber(
+            payload, MAX_TRACKED_SLICES, sliceNumber))
     {
         return;
     }
 
     SliceState &slice = slices[sliceNumber];
     uint16_t value = 0;
-    if (parseUnsignedField(payload, "in_use=", value))
+    if (SmartSdrProtocolParser::parseUnsignedField(payload, "in_use=", value))
     {
         if (value == 0)
         {
             slice = SliceState{};
             Serial.printf("[SMARTSDR] Slice %u no longer in use\n", sliceNumber);
+            startClientBindingIfPossible();
             return;
         }
         slice.inUse = true;
     }
 
-    if (parseUnsignedField(payload, "active=", value))
+    if (SmartSdrProtocolParser::parseUnsignedField(payload, "active=", value))
     {
         slice.active = value != 0;
         slice.inUse = true;
     }
 
+    uint32_t clientHandle = 0;
+    if (SmartSdrProtocolParser::parseHexField(
+            payload, "client_handle=", clientHandle))
+    {
+        slice.clientHandle = clientHandle;
+        slice.clientHandleAvailable = true;
+        slice.inUse = true;
+    }
+
     uint64_t frequencyHz = 0;
-    if (parseFrequencyHz(payload, frequencyHz))
+    if (SmartSdrProtocolParser::parseFrequencyHz(payload, frequencyHz))
     {
         slice.frequencyHz = frequencyHz;
+        slice.reportedFrequencyHz = frequencyHz;
         slice.frequencyAvailable = true;
         slice.inUse = true;
         Serial.printf("[SMARTSDR] Slice %u frequency=%llu.%06llu MHz active=%s\n",
@@ -428,88 +865,34 @@ void processSliceStatus(const char *payload)
                       static_cast<unsigned long long>(frequencyHz % 1000000ULL),
                       slice.active ? "yes" : "no");
     }
+    startClientBindingIfPossible();
 }
 
-int activeSliceNumber()
+int actionReadySliceNumber()
 {
-    int onlyUsableSlice = -1;
-    int onlyActiveSlice = -1;
-    uint8_t usableSliceCount = 0;
-    uint8_t activeSliceCount = 0;
-
-    for (uint8_t index = 0; index < MAX_TRACKED_SLICES; ++index)
-    {
-        const SliceState &slice = slices[index];
-        if (!slice.inUse || !slice.frequencyAvailable)
-        {
-            continue;
-        }
-        if (slice.active)
-        {
-            onlyActiveSlice = index;
-            ++activeSliceCount;
-        }
-        onlyUsableSlice = index;
-        ++usableSliceCount;
-    }
-
-    if (activeSliceCount == 1)
-    {
-        return onlyActiveSlice;
-    }
-    if (activeSliceCount > 1)
+    if (!apiClient.connected() ||
+        currentState != SmartSdrConnection::State::Ready)
     {
         return -1;
     }
-    return usableSliceCount == 1 ? onlyUsableSlice : -1;
-}
 
-int exactlyOneActiveSliceNumber()
-{
     int selectedSlice = -1;
     uint8_t activeSliceCount = 0;
-
     for (uint8_t index = 0; index < MAX_TRACKED_SLICES; ++index)
     {
         const SliceState &slice = slices[index];
-        if (slice.inUse && slice.active && slice.frequencyAvailable)
+        if (!slice.inUse || !slice.active)
         {
-            selectedSlice = index;
-            ++activeSliceCount;
+            continue;
         }
-    }
-    return activeSliceCount == 1 ? selectedSlice : -1;
-}
-
-bool parseResponse(const char *line,
-                   uint32_t &sequence,
-                   uint32_t &responseCode)
-{
-    if (line[0] != 'R')
-    {
-        return false;
+        selectedSlice = index;
+        ++activeSliceCount;
     }
 
-    char *sequenceEnd = nullptr;
-    const unsigned long parsedSequence = strtoul(line + 1, &sequenceEnd, 10);
-    if (sequenceEnd == line + 1 || *sequenceEnd != '|')
-    {
-        return false;
-    }
-
-    const char *responseStart = sequenceEnd + 1;
-    char *responseEnd = nullptr;
-    const unsigned long parsedResponse =
-        strtoul(responseStart, &responseEnd, 16);
-    if (responseEnd == responseStart ||
-        (*responseEnd != '|' && *responseEnd != '\0'))
-    {
-        return false;
-    }
-
-    sequence = static_cast<uint32_t>(parsedSequence);
-    responseCode = static_cast<uint32_t>(parsedResponse);
-    return true;
+    return activeSliceCount == 1 &&
+                   slices[selectedSlice].frequencyAvailable
+               ? selectedSlice
+               : -1;
 }
 
 void processRfPowerResponse(const uint32_t sequence,
@@ -522,12 +905,17 @@ void processRfPowerResponse(const uint32_t sequence,
         return;
     }
 
-    if (responseCode != 0)
+    const ResponseClass responseClass = classifyResponseCode(responseCode);
+    if (responseClass != ResponseClass::Success)
     {
-        Serial.printf("[RF POWER] Radio rejected sequence %lu: code=%08lX\n",
+        Serial.printf("[RF POWER] Radio did not accept sequence %lu: class=%s code=%08lX\n",
                       static_cast<unsigned long>(sequence),
+                      responseClassName(responseClass),
                       static_cast<unsigned long>(responseCode));
-        failRfPowerRequest("Radio rejected command");
+        failRfPowerRequest(
+            responseClass == ResponseClass::Informational
+                ? "Radio returned informational response"
+                : "Radio rejected command");
         return;
     }
 
@@ -538,15 +926,116 @@ void processRfPowerResponse(const uint32_t sequence,
     completeRfPowerRequestIfConfirmed();
 }
 
+void processCommandResponse(const uint32_t sequence,
+                            const uint32_t responseCode)
+{
+    const ResponseClass responseClass = classifyResponseCode(responseCode);
+    CommandType type = CommandType::Session;
+    if (!takeCommandFromLedger(sequence, type))
+    {
+        Serial.printf("[SMARTSDR] Response has no pending command: sequence=%lu class=%s code=%08lX\n",
+                      static_cast<unsigned long>(sequence),
+                      responseClassName(responseClass),
+                      static_cast<unsigned long>(responseCode));
+        return;
+    }
+
+    if (type == CommandType::RfPower)
+    {
+        processRfPowerResponse(sequence, responseCode);
+        return;
+    }
+
+    if (responseClass != ResponseClass::Success &&
+        (type == CommandType::ClientBind ||
+         type == CommandType::TxSubscription))
+    {
+        invalidateClientBinding(
+            type == CommandType::ClientBind
+                ? "SmartSDR client bind rejected"
+                : "TX subscription rejected");
+    }
+
+    if (responseClass == ResponseClass::Informational)
+    {
+        if (type == CommandType::Tuning)
+        {
+            finishTuningCommand(sequence, false);
+        }
+        Serial.printf("[SMARTSDR] Informational response: sequence=%lu type=%s code=%08lX\n",
+                      static_cast<unsigned long>(sequence),
+                      commandTypeName(type),
+                      static_cast<unsigned long>(responseCode));
+        return;
+    }
+
+    if (responseClass == ResponseClass::Error)
+    {
+        if (type == CommandType::Tuning)
+        {
+            finishTuningCommand(sequence, false);
+        }
+        Serial.printf("[SMARTSDR] Command rejected: sequence=%lu type=%s code=%08lX\n",
+                      static_cast<unsigned long>(sequence),
+                      commandTypeName(type),
+                      static_cast<unsigned long>(responseCode));
+        return;
+    }
+
+    if (type == CommandType::Tuning)
+    {
+        finishTuningCommand(sequence, true);
+    }
+    if (type == CommandType::ClientBind)
+    {
+        if (sequence != clientBindSequence || targetClientHandle == 0)
+        {
+            return;
+        }
+        clientBindSequence = 0;
+        clientBindAccepted = true;
+        boundClientHandle = targetClientHandle;
+        txSubscriptionSequence =
+            sendCommand("sub tx all", CommandType::TxSubscription);
+    }
+    if (type == CommandType::TxSubscription)
+    {
+        if (sequence != txSubscriptionSequence || !clientBindAccepted)
+        {
+            return;
+        }
+        txSubscriptionSequence = 0;
+        txSubscriptionAccepted = true;
+        updateSessionReadiness();
+    }
+    if (type == CommandType::Session)
+    {
+        if (acceptedSessionCommandCount < INITIAL_SESSION_COMMAND_COUNT)
+        {
+            ++acceptedSessionCommandCount;
+        }
+        Serial.printf("[SMARTSDR] Initial session command accepted: %u/%u\n",
+                      acceptedSessionCommandCount,
+                      INITIAL_SESSION_COMMAND_COUNT);
+        updateSessionReadiness();
+    }
+    if (type != CommandType::Keepalive)
+    {
+        Serial.printf("[SMARTSDR] Command accepted: sequence=%lu type=%s\n",
+                      static_cast<unsigned long>(sequence),
+                      commandTypeName(type));
+    }
+}
+
 void processApiLine(char *line)
 {
     Serial.printf("[SMARTSDR RX] %s\n", line);
 
     uint32_t responseSequence = 0;
     uint32_t responseCode = 0;
-    if (parseResponse(line, responseSequence, responseCode))
+    if (SmartSdrProtocolParser::parseResponse(line, responseSequence, responseCode))
     {
-        processRfPowerResponse(responseSequence, responseCode);
+        processCommandResponse(responseSequence, responseCode);
         return;
     }
 
@@ -557,33 +1046,52 @@ void processApiLine(char *line)
     }
     ++payload;
 
+    if (strncmp(payload, "client ", 7) == 0)
+    {
+        processClientStatus(payload);
+        return;
+    }
+
     if (strncmp(payload, "slice ", 6) == 0)
     {
         processSliceStatus(payload);
         return;
     }
 
-    if (strncmp(payload, "transmit ", 9) != 0)
+    if (strncmp(payload, "transmit ", 9) != 0 ||
+        strncmp(payload, "transmit band ", 14) == 0)
     {
         return;
     }
 
     uint16_t value = 0;
-    if (parseUnsignedField(line, "rfpower=", value))
+    if (SmartSdrProtocolParser::parseUnsignedField(line, "rfpower=", value))
     {
+        ++rfPowerStatusGeneration;
         if (!rfPowerAvailable || currentRfPower != value)
         {
             Serial.printf("[SMARTSDR] Parsed rfpower raw value=%u\n", value);
         }
         currentRfPower = value;
         rfPowerAvailable = true;
-        currentState = SmartSdrConnection::State::Ready;
+        freshTransmitterStatusReceived = true;
+        updateSessionReadiness();
         if (rfPowerRequest.state ==
                 SmartSdrConnection::RfPowerRequestState::Pending &&
+            rfPowerStatusGeneration !=
+                rfPowerRequest.statusGenerationAtStart &&
             value == rfPowerRequest.requestedPercent)
         {
             rfPowerRequest.statusConfirmed = true;
             completeRfPowerRequestIfConfirmed();
+        }
+        else if (rfPowerRequest.state !=
+                 SmartSdrConnection::RfPowerRequestState::Pending &&
+                 rfPowerRequest.state !=
+                 SmartSdrConnection::RfPowerRequestState::Failed)
+        {
+            confirmedRfPower = value;
+            confirmedRfPowerAvailable = true;
         }
     }
 }
@@ -594,26 +1102,15 @@ void processApiInput()
     {
         const char character = static_cast<char>(apiClient.read());
         lastReceiveMs = millis();
-        if (character == '\r' || character == '\n')
+        const ApiLineParser::Result result = apiLineParser.push(character);
+        if (result == ApiLineParser::Result::LineReady)
         {
-            if (lineLength > 0)
-            {
-                lineBuffer[lineLength] = '\0';
-                processApiLine(lineBuffer);
-                lineLength = 0;
-            }
-            continue;
+            processApiLine(apiLineParser.line());
         }
-
-        if (lineLength + 1 < sizeof(lineBuffer))
+        else if (result == ApiLineParser::Result::Overflow)
         {
-            lineBuffer[lineLength++] = character;
-        }
-        else
-        {
-            Serial.printf("[SMARTSDR] RX line exceeded %u bytes; discarded\n",
-                          static_cast<unsigned>(sizeof(lineBuffer) - 1U));
-            lineLength = 0;
+            Serial.printf("[SMARTSDR] RX line exceeded %u bytes; discarding through newline\n",
+                          static_cast<unsigned>(ApiLineParser::maxLineLength()));
         }
     }
 }
@@ -625,6 +1122,8 @@ void updateApiConnection()
         failRfPowerRequest("TCP connection lost");
         Serial.println("[SMARTSDR] TCP connection lost; retry scheduled");
         apiClient.stop();
+        clearCommandLedger();
+        resetSessionReadiness();
         rfPowerAvailable = false;
         currentState = SmartSdrConnection::State::RadioFound;
         lastConnectAttemptMs = millis();
@@ -633,9 +1132,13 @@ void updateApiConnection()
 
     processApiInput();
     const uint32_t nowMs = millis();
+    expireCommandLedger(nowMs);
     if (nowMs - lastPingMs >= PING_INTERVAL_MS)
     {
-        sendCommand("ping");
+        if (sendCommand("ping", CommandType::Keepalive) == 0)
+        {
+            return;
+        }
         lastPingMs = nowMs;
     }
     if (nowMs - lastReceiveMs >= RX_TIMEOUT_MS)
@@ -643,10 +1146,13 @@ void updateApiConnection()
         Serial.printf("[SMARTSDR] RX timeout after %lu ms; closing TCP\n",
                       static_cast<unsigned long>(RX_TIMEOUT_MS));
         failRfPowerRequest("receive timeout");
+        clearCommandLedger();
+        resetSessionReadiness();
         apiClient.stop();
         rfPowerAvailable = false;
         currentState = SmartSdrConnection::State::RadioFound;
         lastConnectAttemptMs = nowMs;
+        return;
     }
 
     if (rfPowerRequest.state ==
@@ -751,9 +1257,20 @@ uint16_t rfPowerSetting()
     return currentRfPower;
 }
 
+bool confirmedRfPowerPercent(uint16_t &percent)
+{
+    if (!confirmedRfPowerAvailable)
+    {
+        return false;
+    }
+
+    percent = confirmedRfPower;
+    return true;
+}
+
 bool activeSliceFrequencyHz(uint64_t &frequencyHz)
 {
-    const int sliceNumber = activeSliceNumber();
+    const int sliceNumber = actionReadySliceNumber();
     if (sliceNumber < 0)
     {
         return false;
@@ -763,28 +1280,88 @@ bool activeSliceFrequencyHz(uint64_t &frequencyHz)
     return true;
 }
 
-bool requestRfPowerPercent(const uint8_t percent)
+bool showFrequencyStepMessage(const uint16_t stepHz)
 {
-    if (rfPowerRequest.state != RfPowerRequestState::Idle)
+    if (stepHz == 0)
     {
-        Serial.println("[RF POWER] Request skipped: another request is active");
+        Serial.println("[MESSAGE TX] Skipped: step is invalid");
         return false;
     }
+
+    if (actionReadySliceNumber() < 0)
+    {
+        Serial.println("[MESSAGE TX] Skipped: action is not ready");
+        return false;
+    }
+
+    char command[80] = {};
+    snprintf(command,
+             sizeof(command),
+             "message severity=info code=0x000010 \"Tuning step: %u Hz\"",
+             static_cast<unsigned>(stepHz));
+    const uint32_t sequence =
+        sendCommand(command, CommandType::OperatorMessage);
+    if (sequence == 0)
+    {
+        Serial.println("[MESSAGE TX] Failed: TCP command was not written");
+        return false;
+    }
+
+    Serial.printf("[MESSAGE TX] Tuning step: %u Hz\n",
+                  static_cast<unsigned>(stepHz));
+    return true;
+}
+
+bool showFrequencyStepSpot(const uint16_t stepHz)
+{
+    if (stepHz == 0)
+    {
+        Serial.println("[SPOT TX] Skipped: step is invalid");
+        return false;
+    }
+
+    const int sliceNumber = actionReadySliceNumber();
+    if (sliceNumber < 0)
+    {
+        Serial.println("[SPOT TX] Skipped: action is not ready");
+        return false;
+    }
+
+    const uint64_t frequencyHz = slices[sliceNumber].frequencyHz;
+    char command[160] = {};
+    snprintf(command,
+             sizeof(command),
+             "spot add rx_freq=%llu.%06llu callsign=STEP\177%u\177Hz lifetime_seconds=10 priority=1 trigger_action=None",
+             static_cast<unsigned long long>(frequencyHz / 1000000ULL),
+             static_cast<unsigned long long>(frequencyHz % 1000000ULL),
+             static_cast<unsigned>(stepHz));
+    const uint32_t sequence =
+        sendCommand(command, CommandType::FrequencyStepSpot);
+    if (sequence == 0)
+    {
+        Serial.println("[SPOT TX] Failed: TCP command was not written");
+        return false;
+    }
+
+    Serial.printf("[SPOT TX] slice=%d frequency=%llu.%06llu MHz text=\"STEP %u Hz\" lifetime=10 s trigger=None\n",
+                  sliceNumber,
+                  static_cast<unsigned long long>(frequencyHz / 1000000ULL),
+                  static_cast<unsigned long long>(frequencyHz % 1000000ULL),
+                  static_cast<unsigned>(stepHz));
+    return true;
+}
+
+bool requestRfPowerPercent(const uint8_t percent)
+{
     if (percent > 100)
     {
         Serial.println("[RF POWER] Request skipped: percentage is out of range");
         return false;
     }
-    if (!apiClient.connected() || currentState != State::Ready)
-    {
-        Serial.println("[RF POWER] Request skipped: Radio is not ready");
-        return false;
-    }
-
-    const int sliceNumber = exactlyOneActiveSliceNumber();
+    const int sliceNumber = actionReadySliceNumber();
     if (sliceNumber < 0)
     {
-        Serial.println("[RF POWER] Request skipped: not exactly one active slice");
+        Serial.println("[RF POWER] Request skipped: action is not ready");
         return false;
     }
 
@@ -795,24 +1372,39 @@ bool requestRfPowerPercent(const uint8_t percent)
         return false;
     }
 
+    if (rfPowerRequest.state != RfPowerRequestState::Pending &&
+        confirmedRfPowerAvailable &&
+        confirmedRfPower == percent)
+    {
+        Serial.printf("[RF POWER] No-op: %u%% is already confirmed\n", percent);
+        return false;
+    }
+
     char command[48] = {};
     snprintf(command,
              sizeof(command),
              "transmit set rfpower=%u",
              static_cast<unsigned>(percent));
 
-    rfPowerRequest = RfPowerRequest{};
-    rfPowerRequest.state = RfPowerRequestState::Pending;
-    rfPowerRequest.startedMs = millis();
-    rfPowerRequest.requestedPercent = percent;
-    rfPowerRequest.statusConfirmed =
-        rfPowerAvailable && currentRfPower == percent;
-    rfPowerRequest.sequence = sendCommand(command);
-    if (rfPowerRequest.sequence == 0)
+    const uint32_t sequence = sendCommand(command, CommandType::RfPower);
+    if (sequence == 0)
     {
-        failRfPowerRequest("TCP write unavailable");
         return false;
     }
+
+    if (rfPowerRequest.state == RfPowerRequestState::Pending)
+    {
+        Serial.printf("[RF POWER] Superseding sequence=%lu requested=%u%%\n",
+                      static_cast<unsigned long>(rfPowerRequest.sequence),
+                      rfPowerRequest.requestedPercent);
+    }
+
+    rfPowerRequest = RfPowerRequest{};
+    rfPowerRequest.state = RfPowerRequestState::Pending;
+    rfPowerRequest.sequence = sequence;
+    rfPowerRequest.startedMs = millis();
+    rfPowerRequest.statusGenerationAtStart = rfPowerStatusGeneration;
+    rfPowerRequest.requestedPercent = percent;
 
     Serial.printf("[RF POWER] Request pending: sequence=%lu requested=%u%% slice=%d\n",
                   static_cast<unsigned long>(rfPowerRequest.sequence),
@@ -841,17 +1433,10 @@ bool tuneActiveSliceByHz(const int64_t deltaHz)
     {
         return true;
     }
-    if (!apiClient.connected() ||
-        (currentState != State::Connected && currentState != State::Ready))
-    {
-        Serial.println("[ENCODER TX] Skipped: SmartSDR is not connected");
-        return false;
-    }
-
-    const int sliceNumber = activeSliceNumber();
+    const int sliceNumber = actionReadySliceNumber();
     if (sliceNumber < 0)
     {
-        Serial.println("[ENCODER TX] Skipped: no unambiguous active slice");
+        Serial.println("[ENCODER TX] Skipped: action is not ready");
         return false;
     }
 
@@ -871,10 +1456,16 @@ bool tuneActiveSliceByHz(const int64_t deltaHz)
              sliceNumber,
              static_cast<long long>(targetHz / 1000000LL),
              static_cast<long long>(targetHz % 1000000LL));
-    sendCommand(command);
+    const uint32_t sequence = sendCommand(command, CommandType::Tuning);
+    if (sequence == 0)
+    {
+        Serial.println("[ENCODER TX] Failed: TCP command was not written");
+        return false;
+    }
 
     // Keep an optimistic target so rapid turns build on the last command even
     // before the corresponding asynchronous slice status arrives.
+    slice.latestTuningSequence = sequence;
     slice.frequencyHz = static_cast<uint64_t>(targetHz);
     Serial.printf("[ENCODER TX] slice=%d direction=%s delta=%lld Hz target=%lld.%06lld MHz\n",
                   sliceNumber,

@@ -28,6 +28,7 @@ Desktop.ini
 *.log
 
 # Local project history and publication notes
+/AGENTS.md
 /archive_not_for_github/
 /PLAN.md
 /DEVELOPMENT_PROGRESS.md

@@ -39,6 +39,7 @@ uint32_t previousUpdateMs = 0;
 uint32_t radioAnimationStartedMs = 0;
 uint8_t displayedRadioAnimationRow = UINT8_MAX;
 bool radioAnimationActive = false;
+uint8_t activeKey = 0;
 uint8_t blinkingKey = 0;
 uint32_t blinkingKeySelectedMs = 0;
 bool pixelsPrepared = false;
@@ -62,21 +63,21 @@ Color backgroundColor(const uint8_t keyIndex)
 
 Color restingColor(const uint8_t keyIndex, const uint32_t nowMs)
 {
-    if (blinkingKey != keyIndex + 1U)
+    const uint8_t key = static_cast<uint8_t>(keyIndex + 1U);
+    if (blinkingKey == key)
+    {
+        const uint32_t selectedMs = nowMs - blinkingKeySelectedMs;
+        const bool blinkOn =
+            ((selectedMs /
+              NeoPixelConfig::ACTIVE_KEY_BLINK_INTERVAL_MS) % 2U) == 0U;
+        return blinkOn ? ACTIVE_BLINK_BLUE : OFF;
+    }
+
+    if (activeKey != key)
     {
         return backgroundColor(keyIndex);
     }
-
-    const uint32_t selectedMs = nowMs - blinkingKeySelectedMs;
-    if (selectedMs >= NeoPixelConfig::ACTIVE_KEY_BLINK_DURATION_MS)
-    {
-        return ACTIVE_STEADY_BLUE;
-    }
-
-    const bool blinkOn =
-        ((selectedMs /
-          NeoPixelConfig::ACTIVE_KEY_BLINK_INTERVAL_MS) % 2U) == 0U;
-    return blinkOn ? ACTIVE_BLINK_BLUE : OFF;
+    return ACTIVE_STEADY_BLUE;
 }
 
 uint8_t interpolateChannel(const uint8_t from,
@@ -226,8 +227,37 @@ void selectBlinkingKey(const uint8_t key, const uint32_t nowMs)
     blinkingKeySelectedMs = nowMs;
 }
 
+void confirmBlinkingKey(const uint8_t key)
+{
+    if (blinkingKey != key)
+    {
+        return;
+    }
+
+    activeKey = key;
+    blinkingKey = 0;
+    blinkingKeySelectedMs = 0;
+}
+
+void setConfirmedKey(const uint8_t key)
+{
+    if (!initialized || key > NeoKeyConfig::KEY_COUNT)
+    {
+        return;
+    }
+
+    activeKey = key;
+}
+
+void cancelBlinkingKey()
+{
+    blinkingKey = 0;
+    blinkingKeySelectedMs = 0;
+}
+
 void clearBlinkingKey()
 {
+    activeKey = 0;
     blinkingKey = 0;
     blinkingKeySelectedMs = 0;
 }

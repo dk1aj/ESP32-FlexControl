@@ -290,10 +290,20 @@ void updateHeartbeat()
 void selectFrequencyStep(const uint8_t index, const char *gesture)
 {
     frequencyStepIndex = index;
+    const uint16_t stepHz =
+        ButtonConfig::frequencyStepHz(frequencyStepIndex);
     Serial.printf("[KEY] %u gesture=%s action=frequency-step step=%u Hz\n",
                   ButtonConfig::FREQUENCY_STEP_KEY,
                   gesture,
-                  ButtonConfig::frequencyStepHz(frequencyStepIndex));
+                  stepHz);
+    const bool messageSent =
+        SmartSdrConnection::showFrequencyStepMessage(stepHz);
+    const bool spotSent =
+        SmartSdrConnection::showFrequencyStepSpot(stepHz);
+    Serial.printf("[KEY] %u frequency-step message=%s spot=%s\n",
+                  ButtonConfig::FREQUENCY_STEP_KEY,
+                  messageSent ? "sent" : "not-sent",
+                  spotSent ? "sent" : "not-sent");
 }
 
 void cycleFrequencyStep()
@@ -414,7 +424,19 @@ void processNeoKeyEvents(const uint32_t nowMs)
             else if (ButtonConfig::action(key) ==
                      ButtonConfig::Action::RfPowerPreset)
             {
-                KeyLighting::selectBlinkingKey(key, nowMs);
+                const uint8_t percent =
+                    ButtonConfig::defaultRfPowerPercent(key);
+                const bool requested =
+                    SmartSdrConnection::requestRfPowerPercent(percent);
+                if (requested)
+                {
+                    pendingRfPowerKey = key;
+                    KeyLighting::selectBlinkingKey(key, nowMs);
+                }
+                Serial.printf("[KEY] %u RF-preset=%u%% requested=%s\n",
+                              key,
+                              percent,
+                              requested ? "yes" : "no");
             }
             else if (ButtonConfig::action(key) ==
                      ButtonConfig::Action::RoundFrequencyToKhz)
@@ -428,24 +450,6 @@ void processNeoKeyEvents(const uint32_t nowMs)
                 ButtonConfig::Action::CycleFrequencyStep)
             {
                 handleStepKeyReleased(nowMs);
-            }
-            else if (ButtonConfig::action(key) ==
-                     ButtonConfig::Action::RfPowerPreset)
-            {
-                const uint8_t percent =
-                    ButtonConfig::defaultRfPowerPercent(key);
-                const bool requested = pendingRfPowerKey == 0 &&
-                    SmartSdrConnection::requestRfPowerPercent(percent);
-                if (requested)
-                {
-                    pendingRfPowerKey = key;
-                }
-                Serial.printf("[KEY] %u RELEASED name=\"%s\" RF-preset=%u W/%u%% requested=%s\n",
-                              key,
-                              NeoKey::keyName(key),
-                              ButtonConfig::defaultRfPowerWatts(key),
-                              percent,
-                              requested ? "yes" : "no");
             }
         }
     }
@@ -463,6 +467,7 @@ void updateRfPowerRequest()
         {
             Serial.printf("[KEY] %u RF preset confirmed\n",
                           pendingRfPowerKey);
+            KeyLighting::confirmBlinkingKey(pendingRfPowerKey);
         }
         pendingRfPowerKey = 0;
         SmartSdrConnection::clearRfPowerRequestResult();
@@ -470,7 +475,8 @@ void updateRfPowerRequest()
     else if (requestState ==
              SmartSdrConnection::RfPowerRequestState::Failed)
     {
-        Serial.printf("[KEY] RF preset failed; key indication retained\n");
+        Serial.printf("[KEY] RF preset failed; previous indication restored\n");
+        KeyLighting::cancelBlinkingKey();
         pendingRfPowerKey = 0;
         SmartSdrConnection::clearRfPowerRequestResult();
     }
@@ -627,6 +633,17 @@ void loop()
         ButtonConfig::isSixMeterFrequency(activeFrequencyHz))
     {
         KeyLighting::clearBlinkingKey();
+    }
+    else
+    {
+        uint16_t confirmedRfPowerPercent = 0;
+        const uint8_t confirmedKey =
+            SmartSdrConnection::confirmedRfPowerPercent(
+                confirmedRfPowerPercent)
+                ? ButtonConfig::rfPowerKeyForPercent(
+                      confirmedRfPowerPercent)
+                : 0;
+        KeyLighting::setConfirmedKey(confirmedKey);
     }
 
     updateHeartbeat();
