@@ -22,6 +22,8 @@ constexpr Color ACTIVE_BLINK_BLUE = {
     0, 0, NeoPixelConfig::ACTIVE_KEY_BLINK_BLUE_LEVEL};
 constexpr Color ACTIVE_STEADY_BLUE = {
     0, 0, NeoPixelConfig::ACTIVE_KEY_STEADY_BLUE_LEVEL};
+constexpr Color ACTIVE_STATE_RED = {
+    NeoPixelConfig::ACTIVE_STATE_RED_LEVEL, 0, 0};
 constexpr uint8_t RADIO_ANIMATION_STEP_COUNT = NeoKeyConfig::ROW_COUNT;
 constexpr uint32_t RADIO_ANIMATION_STEP_MS = 100;
 
@@ -42,6 +44,7 @@ bool radioAnimationActive = false;
 uint8_t activeKey = 0;
 uint8_t blinkingKey = 0;
 uint32_t blinkingKeySelectedMs = 0;
+bool redIndicators[NeoKeyConfig::KEY_COUNT] = {};
 bool pixelsPrepared = false;
 bool initialized = false;
 
@@ -73,11 +76,15 @@ Color restingColor(const uint8_t keyIndex, const uint32_t nowMs)
         return blinkOn ? ACTIVE_BLINK_BLUE : OFF;
     }
 
-    if (activeKey != key)
+    if (activeKey == key)
     {
-        return backgroundColor(keyIndex);
+        return ACTIVE_STEADY_BLUE;
     }
-    return ACTIVE_STEADY_BLUE;
+    if (redIndicators[keyIndex])
+    {
+        return ACTIVE_STATE_RED;
+    }
+    return backgroundColor(keyIndex);
 }
 
 uint8_t interpolateChannel(const uint8_t from,
@@ -144,13 +151,8 @@ void showRadioAnimationStep(const uint8_t animationRow)
 {
     pixels.clear();
 
-    // Both logical axes are reversed because the NeoKey is mounted upside
-    // down. Reverse the row for top-to-bottom motion and select the last
-    // logical column, which is the physical left column.
-    const uint8_t logicalRow = static_cast<uint8_t>(
-        NeoKeyConfig::ROW_COUNT - 1U - animationRow);
-    const uint8_t logicalColumn = static_cast<uint8_t>(
-        NeoKeyConfig::COLUMN_COUNT - 1U);
+    const uint8_t logicalRow = animationRow;
+    constexpr uint8_t logicalColumn = 0;
     const uint8_t keyIndex = static_cast<uint8_t>(
         logicalRow * NeoKeyConfig::COLUMN_COUNT + logicalColumn);
     pixels.setPixelColor(
@@ -247,6 +249,16 @@ void setConfirmedKey(const uint8_t key)
     }
 
     activeKey = key;
+}
+
+void setRedIndicator(const uint8_t key, const bool enabled)
+{
+    if (!initialized || key < 1 || key > NeoKeyConfig::KEY_COUNT)
+    {
+        return;
+    }
+
+    redIndicators[key - 1U] = enabled;
 }
 
 void cancelBlinkingKey()

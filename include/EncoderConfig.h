@@ -5,15 +5,16 @@
 
 namespace EncoderConfig
 {
-constexpr gpio_num_t ENCODER_PIN_A = GPIO_NUM_4;
-constexpr gpio_num_t ENCODER_PIN_B = GPIO_NUM_5;
+// Fixed XIAO wiring: D0/D1.
+constexpr gpio_num_t ENCODER_PIN_A = GPIO_NUM_1;
+constexpr gpio_num_t ENCODER_PIN_B = GPIO_NUM_2;
 
 constexpr uint32_t SERIAL_BAUD_RATE = 115200;
 constexpr int ENCODER_PULSES_PER_REVOLUTION = 100;
 
-// Generic ESP32-S3-DevKitC-1 boards commonly use GPIO48 for the WS2812 RGB LED.
-// Change this pin if the actual N16R8 board routes its onboard LED differently.
-constexpr uint8_t RGB_LED_PIN = 48;
+// XIAO user LED is a single-color, active-low LED rather than a NeoPixel.
+constexpr uint8_t STATUS_LED_PIN = 21;
+constexpr bool STATUS_LED_ACTIVE_LOW = true;
 constexpr bool HEARTBEAT_ENABLED = false;
 constexpr uint32_t HEARTBEAT_PERIOD_MS = 1600;
 constexpr uint32_t HEARTBEAT_UPDATE_INTERVAL_MS = 20;

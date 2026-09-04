@@ -49,6 +49,8 @@ enum class CommandType : uint8_t
     Tuning,
     OperatorMessage,
     FrequencyStepSpot,
+    Rit,
+    Mute,
     RfPower
 };
 
@@ -77,6 +79,14 @@ struct SliceState
     uint64_t reportedFrequencyHz = 0;
     uint32_t clientHandle = 0;
     uint32_t latestTuningSequence = 0;
+    bool ritOnAvailable = false;
+    bool ritOn = false;
+    bool ritFrequencyAvailable = false;
+    int32_t ritFrequencyHz = 0;
+    bool audioMuteAvailable = false;
+    bool audioMute = false;
+    uint32_t ritSequence = 0;
+    uint32_t muteSequence = 0;
 };
 
 struct ClientState
@@ -229,6 +239,10 @@ const char *commandTypeName(const CommandType type)
         return "operator-message";
     case CommandType::FrequencyStepSpot:
         return "frequency-step-spot";
+    case CommandType::Rit:
+        return "rit";
+    case CommandType::Mute:
+        return "mute";
     case CommandType::RfPower:
         return "rf-power";
     }
@@ -322,6 +336,48 @@ void finishTuningCommand(const uint32_t sequence, const bool accepted)
     }
 }
 
+void finishSliceToggleCommand(const uint32_t sequence,
+                              const CommandType type,
+                              const bool accepted)
+{
+    for (uint8_t index = 0; index < MAX_TRACKED_SLICES; ++index)
+    {
+        SliceState &slice = slices[index];
+        uint32_t &pendingSequence =
+            type == CommandType::Rit
+                ? slice.ritSequence
+                : slice.muteSequence;
+        if (pendingSequence != sequence)
+        {
+            continue;
+        }
+
+        pendingSequence = 0;
+        if (type == CommandType::Rit)
+        {
+            if (accepted)
+            {
+                slice.ritOn = !slice.ritOn;
+            }
+            slice.ritOnAvailable = true;
+        }
+        else
+        {
+            if (accepted)
+            {
+                slice.audioMute = !slice.audioMute;
+            }
+            slice.audioMuteAvailable = true;
+        }
+        Serial.printf("[SLICE CONTROL] %s sequence=%lu slice=%u result=%s\n",
+                      commandTypeName(type),
+                      static_cast<unsigned long>(sequence),
+                      index,
+                      accepted ? "accepted" : "failed");
+        return;
+    }
+}
+
 void expireCommandLedger(const uint32_t nowMs)
 {
     for (CommandLedgerEntry &entry : commandLedger)
@@ -343,6 +399,11 @@ void expireCommandLedger(const uint32_t nowMs)
         else if (entry.type == CommandType::Tuning)
         {
             finishTuningCommand(entry.sequence, false);
+        }
+        else if (entry.type == CommandType::Rit ||
+                 entry.type == CommandType::Mute)
+        {
+            finishSliceToggleCommand(entry.sequence, entry.type, false);
         }
         else if (entry.type == CommandType::ClientBind ||
                  entry.type == CommandType::TxSubscription)
@@ -843,6 +904,40 @@ void processSliceStatus(const char *payload)
         slice.inUse = true;
     }
 
+    if (SmartSdrProtocolParser::parseUnsignedField(payload, "rit_on=", value))
+    {
+        slice.ritOn = value != 0;
+        slice.ritOnAvailable = true;
+        slice.ritSequence = 0;
+        slice.inUse = true;
+        Serial.printf("[SMARTSDR] Slice %u RIT=%s\n",
+                      sliceNumber,
+                      slice.ritOn ? "on" : "off");
+    }
+
+    int32_t signedValue = 0;
+    if (SmartSdrProtocolParser::parseSignedField(
+            payload, "rit_freq=", signedValue))
+    {
+        slice.ritFrequencyHz = signedValue;
+        slice.ritFrequencyAvailable = true;
+        slice.inUse = true;
+        Serial.printf("[SMARTSDR] Slice %u RIT offset=%ld Hz\n",
+                      sliceNumber,
+                      static_cast<long>(slice.ritFrequencyHz));
+    }
+
+    if (SmartSdrProtocolParser::parseUnsignedField(payload, "audio_mute=", value))
+    {
+        slice.audioMute = value != 0;
+        slice.audioMuteAvailable = true;
+        slice.muteSequence = 0;
+        slice.inUse = true;
+        Serial.printf("[SMARTSDR] Slice %u audio mute=%s\n",
+                      sliceNumber,
+                      slice.audioMute ? "on" : "off");
+    }
+
     uint32_t clientHandle = 0;
     if (SmartSdrProtocolParser::parseHexField(
             payload, "client_handle=", clientHandle))
@@ -944,6 +1039,14 @@ void processCommandResponse(const uint32_t sequence,
     {
         processRfPowerResponse(sequence, responseCode);
         return;
+    }
+
+    if (type == CommandType::Rit || type == CommandType::Mute)
+    {
+        finishSliceToggleCommand(
+            sequence,
+            type,
+            responseClass == ResponseClass::Success);
     }
 
     if (responseClass != ResponseClass::Success &&
@@ -1348,6 +1451,108 @@ bool showFrequencyStepSpot(const uint16_t stepHz)
                   static_cast<unsigned long long>(frequencyHz / 1000000ULL),
                   static_cast<unsigned long long>(frequencyHz % 1000000ULL),
                   static_cast<unsigned>(stepHz));
+    return true;
+}
+
+bool activeSliceRitEnabled(bool &enabled)
+{
+    const int sliceNumber = actionReadySliceNumber();
+    if (sliceNumber < 0 || !slices[sliceNumber].ritOnAvailable)
+    {
+        return false;
+    }
+
+    enabled = slices[sliceNumber].ritOn;
+    return true;
+}
+
+bool activeSliceMuteEnabled(bool &enabled)
+{
+    const int sliceNumber = actionReadySliceNumber();
+    if (sliceNumber < 0 || !slices[sliceNumber].audioMuteAvailable)
+    {
+        return false;
+    }
+
+    enabled = slices[sliceNumber].audioMute;
+    return true;
+}
+
+bool toggleActiveSliceRit()
+{
+    const int sliceNumber = actionReadySliceNumber();
+    if (sliceNumber < 0)
+    {
+        Serial.println("[RIT] Toggle skipped: action is not ready");
+        return false;
+    }
+
+    SliceState &slice = slices[sliceNumber];
+    if (!slice.ritOnAvailable || !slice.ritFrequencyAvailable ||
+        slice.ritSequence != 0)
+    {
+        Serial.println("[RIT] Toggle skipped: current state/offset is unavailable or pending");
+        return false;
+    }
+
+    const bool target = !slice.ritOn;
+    char command[64] = {};
+    snprintf(command,
+             sizeof(command),
+             "slice set %d rit_on=%u rit_freq=%ld",
+             sliceNumber,
+             target ? 1U : 0U,
+             static_cast<long>(slice.ritFrequencyHz));
+    const uint32_t sequence = sendCommand(command, CommandType::Rit);
+    if (sequence == 0)
+    {
+        return false;
+    }
+
+    slice.ritSequence = sequence;
+    slice.ritOnAvailable = false;
+    Serial.printf("[RIT] Toggle pending: sequence=%lu slice=%d target=%s\n",
+                  static_cast<unsigned long>(sequence),
+                  sliceNumber,
+                  target ? "on" : "off");
+    return true;
+}
+
+bool toggleActiveSliceMute()
+{
+    const int sliceNumber = actionReadySliceNumber();
+    if (sliceNumber < 0)
+    {
+        Serial.println("[MUTE] Toggle skipped: action is not ready");
+        return false;
+    }
+
+    SliceState &slice = slices[sliceNumber];
+    if (!slice.audioMuteAvailable || slice.muteSequence != 0)
+    {
+        Serial.println("[MUTE] Toggle skipped: current state is unavailable or pending");
+        return false;
+    }
+
+    const bool target = !slice.audioMute;
+    char command[48] = {};
+    snprintf(command,
+             sizeof(command),
+             "slice set %d audio_mute=%u",
+             sliceNumber,
+             target ? 1U : 0U);
+    const uint32_t sequence = sendCommand(command, CommandType::Mute);
+    if (sequence == 0)
+    {
+        return false;
+    }
+
+    slice.muteSequence = sequence;
+    slice.audioMuteAvailable = false;
+    Serial.printf("[MUTE] Toggle pending: sequence=%lu slice=%d target=%s\n",
+                  static_cast<unsigned long>(sequence),
+                  sliceNumber,
+                  target ? "on" : "off");
     return true;
 }
 

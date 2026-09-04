@@ -14,6 +14,7 @@ enum class State : uint8_t
 
 void begin();
 void update();
+bool openSetupPortal();
 State state();
 bool isConnected();
 IPAddress localIp();

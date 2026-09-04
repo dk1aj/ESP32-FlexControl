@@ -10,17 +10,19 @@ enum class Action : uint8_t
 {
     None,
     CycleFrequencyStep,
+    ToggleRit,
+    ToggleMute,
     RoundFrequencyToKhz,
     RfPowerPreset
 };
 
-// Button 1 controls the encoder tuning step. Buttons 4 through 11 select the
-// eight HF power presets. Buttons 2 and 3 intentionally have no action;
+// Button 1 controls the encoder tuning step. Buttons 2 and 3 toggle RIT and
+// Slice audio mute. Buttons 4 through 11 select the eight HF power presets;
 // button 12 rounds the active Slice frequency to the nearest full kHz.
 constexpr Action BUTTON_ACTIONS[NeoKeyConfig::KEY_COUNT] = {
     Action::CycleFrequencyStep,
-    Action::None,
-    Action::None,
+    Action::ToggleRit,
+    Action::ToggleMute,
     Action::RfPowerPreset,
     Action::RfPowerPreset,
     Action::RfPowerPreset,

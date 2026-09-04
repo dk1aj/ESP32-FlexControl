@@ -4,20 +4,22 @@
 
 namespace NeoKeyConfig
 {
-// The NeoKey board is installed upside down. Reversing both axes rotates the
-// logical matrix by 180 degrees while leaving the wiring unchanged.
-constexpr uint8_t COLUMN_PINS[] = {41, 42, 2};
-constexpr uint8_t ROW_PINS[] = {47, 38, 39, 40};
+// Fixed physical wiring: COL1..3 = D2..D4 (GPIO3..5),
+// ROW1..4 = D5..D8 (GPIO6, GPIO43, GPIO44, GPIO7).
+// Keep both matrix axes in physical order so the installed keypad is numbered
+// row-wise with key 1 at top-left and key 12 at bottom-right.
+constexpr uint8_t COLUMN_PINS[] = {3, 4, 5};
+constexpr uint8_t ROW_PINS[] = {6, 43, 44, 7};
 
 constexpr uint8_t COLUMN_COUNT = 3;
 constexpr uint8_t ROW_COUNT = 4;
 constexpr uint8_t KEY_COUNT = COLUMN_COUNT * ROW_COUNT;
 
 constexpr const char *KEY_NAMES[KEY_COUNT] = {
-    "Taste 1", "Taste 2", "Taste 3",
-    "Taste 4", "Taste 5", "Taste 6",
-    "Taste 7", "Taste 8", "Taste 9",
-    "Taste 10", "Taste 11", "Taste 12"
+    "STEP", "RIT", "MUTE",
+    "2%", "4%", "10%",
+    "20%", "40%", "60%",
+    "80%", "90%", "RND kHz"
 };
 
 constexpr uint32_t SCAN_INTERVAL_US = 1000;

@@ -127,6 +127,46 @@ inline bool parseUnsignedField(const char *line,
     return true;
 }
 
+inline bool parseSignedField(const char *line,
+                             const char *field,
+                             int32_t &value)
+{
+    const char *cursor = Detail::findFieldValue(line, field);
+    if (cursor == nullptr)
+    {
+        return false;
+    }
+
+    const bool negative = *cursor == '-';
+    if (negative)
+    {
+        ++cursor;
+    }
+
+    uint32_t parsed = 0;
+    if (!Detail::parseDecimalUint32(cursor, parsed) ||
+        !Detail::isTokenDelimiter(*cursor) ||
+        (!negative && parsed > static_cast<uint32_t>(INT32_MAX)) ||
+        (negative && parsed > static_cast<uint32_t>(INT32_MAX) + 1U))
+    {
+        return false;
+    }
+
+    if (!negative)
+    {
+        value = static_cast<int32_t>(parsed);
+    }
+    else if (parsed == static_cast<uint32_t>(INT32_MAX) + 1U)
+    {
+        value = INT32_MIN;
+    }
+    else
+    {
+        value = -static_cast<int32_t>(parsed);
+    }
+    return true;
+}
+
 inline bool parseHexField(const char *line,
                           const char *field,
                           uint32_t &value)

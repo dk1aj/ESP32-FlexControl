@@ -10,6 +10,7 @@ void startRadioConnectedAnimation(uint32_t nowMs);
 void selectBlinkingKey(uint8_t key, uint32_t nowMs);
 void confirmBlinkingKey(uint8_t key);
 void setConfirmedKey(uint8_t key);
+void setRedIndicator(uint8_t key, bool enabled);
 void cancelBlinkingKey();
 void clearBlinkingKey();
 void update(uint32_t nowMs);

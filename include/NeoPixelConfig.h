@@ -6,17 +6,17 @@
 
 namespace NeoPixelConfig
 {
-constexpr uint8_t DATA_PIN = 21;
+// Fixed XIAO wiring: D9 / GPIO8. D10 / GPIO9 remains free.
+constexpr uint8_t DATA_PIN = 8;
 constexpr uint16_t PIXEL_COUNT = 15;
 constexpr uint8_t BRIGHTNESS = 255;
 
-// NeoKey LEDs are wired in a row-wise zigzag chain. This mapping follows the
-// matrix after its 180-degree rotation in NeoKeyConfig.h.
+// NeoKey LEDs follow the logical matrix and the physical row-wise zigzag chain.
 constexpr uint8_t KEY_PIXEL_MAP[NeoKeyConfig::KEY_COUNT] = {
-    9, 10, 11,
-    8, 7, 6,
-    3, 4, 5,
-    2, 1, 0
+    0, 1, 2,
+    5, 4, 3,
+    6, 7, 8,
+    11, 10, 9
 };
 
 // Lowest stable white level directly above off; no breathing/glow animation.
@@ -47,6 +47,7 @@ constexpr uint32_t ACTIVE_KEY_BLINK_INTERVAL_MS = 400;
 constexpr uint32_t ACTIVE_KEY_BLINK_DURATION_MS = 5000;
 constexpr uint8_t ACTIVE_KEY_BLINK_BLUE_LEVEL = 38; // Rounded 15% of 255.
 constexpr uint8_t ACTIVE_KEY_STEADY_BLUE_LEVEL = 26; // Rounded 10% of 255.
+constexpr uint8_t ACTIVE_STATE_RED_LEVEL = 26; // Dim red for enabled RIT/Mute.
 
 static_assert(PIXEL_COUNT > 0, "At least one NeoPixel is required");
 static_assert(sizeof(KEY_PIXEL_MAP) / sizeof(KEY_PIXEL_MAP[0]) ==

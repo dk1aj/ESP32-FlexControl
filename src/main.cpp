@@ -1,5 +1,4 @@
 #include <Arduino.h>
-#include <Adafruit_NeoPixel.h>
 #include <WiFi.h>
 #include <driver/pcnt.h>
 #include <esp_err.h>
@@ -20,10 +19,6 @@ constexpr pcnt_unit_t ENCODER_PCNT_UNIT = PCNT_UNIT_0;
 constexpr int16_t PCNT_HIGH_LIMIT = 30000;
 constexpr int16_t PCNT_LOW_LIMIT = -30000;
 
-Adafruit_NeoPixel onboardHeartbeat(1,
-                                   EncoderConfig::RGB_LED_PIN,
-                                   NEO_GRB + NEO_KHZ800);
-
 portMUX_TYPE encoderMux = portMUX_INITIALIZER_UNLOCKED;
 volatile int64_t encoderLimitOffset = 0;
 int64_t zeroOffset = 0;
@@ -42,6 +37,11 @@ enum class StepKeyState : uint8_t
 StepKeyState stepKeyState = StepKeyState::Idle;
 uint32_t stepKeyPressedMs = 0;
 uint32_t firstClickReleasedMs = 0;
+constexpr uint32_t PORTAL_GESTURE_HOLD_MS = 2000;
+bool portalGestureActive = false;
+bool portalGestureTriggered = false;
+bool suppressPortalGestureKeys = false;
+uint32_t portalGestureStartedMs = 0;
 
 void checkEspError(const esp_err_t error, const char *operation)
 {
@@ -237,7 +237,8 @@ int64_t readRawEncoderCount()
 
 void updateHeartbeat()
 {
-    static uint32_t previousColor = UINT32_MAX;
+    static bool previousOn = false;
+    static bool initialized = false;
     const bool blinkOn = ((millis() / 400U) % 2U) == 0U;
     uint8_t red = 0;
     uint8_t green = 0;
@@ -278,12 +279,13 @@ void updateHeartbeat()
         break;
     }
 
-    const uint32_t color = onboardHeartbeat.Color(red, green, blue);
-    if (color != previousColor)
+    const bool on = red != 0 || green != 0 || blue != 0;
+    if (!initialized || on != previousOn)
     {
-        onboardHeartbeat.setPixelColor(0, color);
-        onboardHeartbeat.show();
-        previousColor = color;
+        digitalWrite(EncoderConfig::STATUS_LED_PIN,
+                     on == EncoderConfig::STATUS_LED_ACTIVE_LOW ? LOW : HIGH);
+        previousOn = on;
+        initialized = true;
     }
 }
 
@@ -317,8 +319,7 @@ void cycleFrequencyStep()
 void handleStepKeyPressed(const uint32_t nowMs)
 {
     if (stepKeyState == StepKeyState::WaitingForSecondClick &&
-        nowMs - firstClickReleasedMs <=
-            ButtonConfig::DOUBLE_CLICK_WINDOW_MS)
+        nowMs - firstClickReleasedMs <= ButtonConfig::DOUBLE_CLICK_WINDOW_MS)
     {
         stepKeyState = StepKeyState::SecondPressed;
     }
@@ -409,9 +410,17 @@ void roundActiveSliceToNearestKhz()
 
 void processNeoKeyEvents(const uint32_t nowMs)
 {
+    const bool suppressPortalKeys = suppressPortalGestureKeys;
     for (uint8_t key = 1; key <= NeoKeyConfig::KEY_COUNT; ++key)
     {
-        if (NeoKey::wasKeyPressed(key))
+        const bool pressed = NeoKey::wasKeyPressed(key);
+        const bool released = NeoKey::wasKeyReleased(key);
+        if (suppressPortalKeys && (key == 1 || key == 12))
+        {
+            continue;
+        }
+
+        if (pressed)
         {
             Serial.printf("[KEY] %u PRESSED name=\"%s\"\n",
                           key,
@@ -420,6 +429,24 @@ void processNeoKeyEvents(const uint32_t nowMs)
                 ButtonConfig::Action::CycleFrequencyStep)
             {
                 handleStepKeyPressed(nowMs);
+            }
+            else if (ButtonConfig::action(key) ==
+                     ButtonConfig::Action::ToggleRit)
+            {
+                const bool requested =
+                    SmartSdrConnection::toggleActiveSliceRit();
+                Serial.printf("[KEY] %u RIT toggle requested=%s\n",
+                              key,
+                              requested ? "yes" : "no");
+            }
+            else if (ButtonConfig::action(key) ==
+                     ButtonConfig::Action::ToggleMute)
+            {
+                const bool requested =
+                    SmartSdrConnection::toggleActiveSliceMute();
+                Serial.printf("[KEY] %u Mute toggle requested=%s\n",
+                              key,
+                              requested ? "yes" : "no");
             }
             else if (ButtonConfig::action(key) ==
                      ButtonConfig::Action::RfPowerPreset)
@@ -444,16 +471,63 @@ void processNeoKeyEvents(const uint32_t nowMs)
                 roundActiveSliceToNearestKhz();
             }
         }
-        if (NeoKey::wasKeyReleased(key))
-        {
-            if (ButtonConfig::action(key) ==
+        if (released &&
+            ButtonConfig::action(key) ==
                 ButtonConfig::Action::CycleFrequencyStep)
-            {
-                handleStepKeyReleased(nowMs);
-            }
+        {
+            handleStepKeyReleased(nowMs);
         }
     }
+    if (suppressPortalKeys &&
+        !NeoKey::isKeyPressed(1) &&
+        !NeoKey::isKeyPressed(12))
+    {
+        suppressPortalGestureKeys = false;
+        Serial.println("[KEY] Portal gesture keys released; normal actions enabled");
+    }
     updateStepKeyGesture(nowMs);
+}
+
+void updatePortalGesture(const uint32_t nowMs)
+{
+    const bool bothKeysPressed =
+        NeoKey::isKeyPressed(1) && NeoKey::isKeyPressed(12);
+    if (!portalGestureActive)
+    {
+        if (!bothKeysPressed)
+        {
+            return;
+        }
+
+        portalGestureActive = true;
+        portalGestureTriggered = false;
+        suppressPortalGestureKeys = true;
+        stepKeyState = StepKeyState::Idle;
+        portalGestureStartedMs = nowMs;
+        Serial.printf("[KEY] Portal gesture 1+12 started; hold=%lu ms\n",
+                      static_cast<unsigned long>(PORTAL_GESTURE_HOLD_MS));
+        return;
+    }
+
+    if (!bothKeysPressed)
+    {
+        if (!portalGestureTriggered)
+        {
+            Serial.println("[KEY] Portal gesture cancelled before hold time");
+        }
+        portalGestureActive = false;
+        portalGestureTriggered = false;
+        return;
+    }
+
+    if (!portalGestureTriggered &&
+        nowMs - portalGestureStartedMs >= PORTAL_GESTURE_HOLD_MS)
+    {
+        portalGestureTriggered = WifiProvisioning::openSetupPortal();
+        SmartSdrConnection::update();
+        Serial.printf("[KEY] Portal gesture completed: portal=%s\n",
+                      portalGestureTriggered ? "opened" : "failed");
+    }
 }
 
 void updateRfPowerRequest()
@@ -522,11 +596,11 @@ void setup()
     Serial.printf("[ENCODER] PCNT ready; position reset to zero; tune step=%u Hz\n",
                   ButtonConfig::frequencyStepHz(frequencyStepIndex));
 
-    onboardHeartbeat.begin();
-    onboardHeartbeat.clear();
-    onboardHeartbeat.show();
-    Serial.printf("[LED] Connection status LED ready on GPIO%u\n",
-                  EncoderConfig::RGB_LED_PIN);
+    pinMode(EncoderConfig::STATUS_LED_PIN, OUTPUT);
+    digitalWrite(EncoderConfig::STATUS_LED_PIN,
+                 EncoderConfig::STATUS_LED_ACTIVE_LOW ? HIGH : LOW);
+    Serial.printf("[LED] Monochrome connection status LED ready on GPIO%u (active-low)\n",
+                  EncoderConfig::STATUS_LED_PIN);
 
     NeoKey::begin();
     Serial.printf("[KEY] Matrix ready: keys=%u scan=%lu us debounce=%lu ms\n",
@@ -595,7 +669,7 @@ void loop()
         if (radioState == SmartSdrConnection::State::Connected)
         {
             KeyLighting::startRadioConnectedAnimation(millis());
-            Serial.println("[LED] Radio connected animation: left column keys=12,9,6,3 color=green step=100 ms");
+            Serial.println("[LED] Radio connected animation: left column keys=1,4,7,10 color=green step=100 ms");
         }
         previousRadioState = radioState;
         if (radioState == SmartSdrConnection::State::RadioFound ||
@@ -646,8 +720,18 @@ void loop()
         KeyLighting::setConfirmedKey(confirmedKey);
     }
 
+    bool ritEnabled = false;
+    KeyLighting::setRedIndicator(
+        2,
+        SmartSdrConnection::activeSliceRitEnabled(ritEnabled) && ritEnabled);
+    bool muteEnabled = false;
+    KeyLighting::setRedIndicator(
+        3,
+        SmartSdrConnection::activeSliceMuteEnabled(muteEnabled) && muteEnabled);
+
     updateHeartbeat();
     NeoKey::update();
+    updatePortalGesture(millis());
     KeyLighting::update(millis());
     processNeoKeyEvents(millis());
 

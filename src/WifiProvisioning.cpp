@@ -5,6 +5,9 @@
 #include <WebServer.h>
 #include <WiFi.h>
 
+#include <cstddef>
+#include <cstring>
+
 #include "WifiSecrets.local.h"
 
 namespace
@@ -12,6 +15,16 @@ namespace
 constexpr char PREFERENCES_NAMESPACE[] = "flexwifi";
 constexpr char SSID_KEY[] = "ssid";
 constexpr char PASSWORD_KEY[] = "password";
+constexpr char CREDENTIAL_SLOT_KEYS[][7] = {"cred_0", "cred_1"};
+constexpr char ACTIVE_CREDENTIAL_SLOT_KEY[] = "cred_active";
+constexpr uint8_t CREDENTIAL_SLOT_COUNT = 2;
+constexpr uint8_t INVALID_CREDENTIAL_SLOT = UINT8_MAX;
+constexpr uint32_t CREDENTIAL_MAGIC = 0x57494649UL;
+constexpr uint16_t CREDENTIAL_VERSION = 1;
+constexpr size_t MAX_SSID_LENGTH = 32;
+constexpr size_t MAX_PASSWORD_LENGTH = 64;
+constexpr size_t MIN_SETUP_AP_PASSWORD_LENGTH = 8;
+constexpr size_t MAX_SETUP_AP_PASSWORD_LENGTH = 63;
 constexpr char SETUP_AP_NAME[] = "ESP32-Radio-Setup";
 constexpr uint32_t WIFI_CONNECT_TIMEOUT_MS = 20000;
 constexpr uint32_t RESTART_DELAY_MS = 1500;
@@ -29,21 +42,185 @@ bool portalHandlersConfigured = false;
 bool stationConnectedOnce = false;
 uint32_t stationAttempt = 0;
 
+struct CredentialRecord
+{
+    uint32_t magic = CREDENTIAL_MAGIC;
+    uint16_t version = CREDENTIAL_VERSION;
+    uint8_t ssidLength = 0;
+    uint8_t passwordLength = 0;
+    char ssid[MAX_SSID_LENGTH + 1] = {};
+    char password[MAX_PASSWORD_LENGTH + 1] = {};
+    uint8_t reserved[2] = {};
+    uint32_t checksum = 0;
+};
+
+static_assert(offsetof(CredentialRecord, checksum) == 108,
+              "Credential record layout changed");
+static_assert(sizeof(CredentialRecord) == 112,
+              "Credential record size changed");
+static_assert(sizeof(WifiSecrets::SETUP_AP_PASSWORD) - 1U >=
+                  MIN_SETUP_AP_PASSWORD_LENGTH &&
+              sizeof(WifiSecrets::SETUP_AP_PASSWORD) - 1U <=
+                  MAX_SETUP_AP_PASSWORD_LENGTH,
+              "The setup AP password must contain 8 to 63 characters");
+
+uint32_t credentialChecksum(const CredentialRecord &record)
+{
+    constexpr uint32_t FNV_OFFSET_BASIS = 2166136261UL;
+    constexpr uint32_t FNV_PRIME = 16777619UL;
+    const uint8_t *bytes = reinterpret_cast<const uint8_t *>(&record);
+    uint32_t checksum = FNV_OFFSET_BASIS;
+    for (size_t index = 0; index < offsetof(CredentialRecord, checksum); ++index)
+    {
+        checksum ^= bytes[index];
+        checksum *= FNV_PRIME;
+    }
+    return checksum;
+}
+
+bool makeCredentialRecord(const String &ssid,
+                          const String &password,
+                          CredentialRecord &record)
+{
+    if (ssid.isEmpty() || ssid.length() > MAX_SSID_LENGTH ||
+        password.length() > MAX_PASSWORD_LENGTH)
+    {
+        return false;
+    }
+
+    record = CredentialRecord{};
+    record.ssidLength = static_cast<uint8_t>(ssid.length());
+    record.passwordLength = static_cast<uint8_t>(password.length());
+    memcpy(record.ssid, ssid.c_str(), record.ssidLength);
+    memcpy(record.password, password.c_str(), record.passwordLength);
+    record.checksum = credentialChecksum(record);
+    return true;
+}
+
+bool credentialRecordValid(const CredentialRecord &record)
+{
+    return record.magic == CREDENTIAL_MAGIC &&
+           record.version == CREDENTIAL_VERSION &&
+           record.ssidLength > 0 &&
+           record.ssidLength <= MAX_SSID_LENGTH &&
+           record.passwordLength <= MAX_PASSWORD_LENGTH &&
+           record.ssid[record.ssidLength] == '\0' &&
+           record.password[record.passwordLength] == '\0' &&
+           strlen(record.ssid) == record.ssidLength &&
+           strlen(record.password) == record.passwordLength &&
+           record.checksum == credentialChecksum(record);
+}
+
+bool readCredentialSlot(Preferences &preferences,
+                        const uint8_t slot,
+                        CredentialRecord &record)
+{
+    if (slot >= CREDENTIAL_SLOT_COUNT ||
+        preferences.getBytesLength(CREDENTIAL_SLOT_KEYS[slot]) !=
+            sizeof(CredentialRecord))
+    {
+        return false;
+    }
+
+    return preferences.getBytes(CREDENTIAL_SLOT_KEYS[slot],
+                                &record,
+                                sizeof(record)) == sizeof(record) &&
+           credentialRecordValid(record);
+}
+
+bool saveStoredCredentialRecord(const String &ssid, const String &password)
+{
+    CredentialRecord stagedRecord;
+    if (!makeCredentialRecord(ssid, password, stagedRecord))
+    {
+        return false;
+    }
+
+    Preferences preferences;
+    if (!preferences.begin(PREFERENCES_NAMESPACE, false))
+    {
+        Serial.println("[WIFI] Preferences open failed while saving");
+        return false;
+    }
+
+    const uint8_t activeSlot =
+        preferences.getUChar(ACTIVE_CREDENTIAL_SLOT_KEY,
+                             INVALID_CREDENTIAL_SLOT);
+    const uint8_t stagedSlot = activeSlot == 0 ? 1 : 0;
+    const size_t written = preferences.putBytes(
+        CREDENTIAL_SLOT_KEYS[stagedSlot],
+        &stagedRecord,
+        sizeof(stagedRecord));
+
+    CredentialRecord verifiedRecord;
+    const bool stagedRecordVerified =
+        written == sizeof(stagedRecord) &&
+        readCredentialSlot(preferences, stagedSlot, verifiedRecord) &&
+        memcmp(&stagedRecord, &verifiedRecord, sizeof(stagedRecord)) == 0;
+    if (!stagedRecordVerified)
+    {
+        preferences.end();
+        Serial.println("[WIFI] Staged credential record verification failed");
+        return false;
+    }
+
+    const bool activated =
+        preferences.putUChar(ACTIVE_CREDENTIAL_SLOT_KEY, stagedSlot) ==
+        sizeof(stagedSlot);
+    preferences.end();
+    if (!activated)
+    {
+        Serial.println("[WIFI] Credential activation failed; previous record preserved");
+        return false;
+    }
+
+    Serial.printf("[WIFI] Credential record version=%u activated in slot=%u\n",
+                  CREDENTIAL_VERSION,
+                  stagedSlot);
+    return true;
+}
+
+bool eraseStoredCredentialRecord()
+{
+    Preferences preferences;
+    if (!preferences.begin(PREFERENCES_NAMESPACE, false))
+    {
+        Serial.println("[WIFI] Preferences open failed while erasing");
+        return false;
+    }
+
+    const bool erased = preferences.clear();
+    preferences.end();
+    if (!erased)
+    {
+        Serial.println("[WIFI] Stored credential erase failed");
+        return false;
+    }
+
+    Serial.println("[WIFI] Stored credentials erased");
+    return true;
+}
+
 String configurationPage()
 {
     return F(
-        "<!doctype html><html lang='de'><head>"
+        "<!doctype html><html lang='en'><head>"
         "<meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
-        "<title>Radio WLAN</title><style>"
+        "<title>Radio Wi-Fi Setup</title><style>"
         "body{font-family:sans-serif;max-width:34rem;margin:2rem auto;padding:0 1rem}"
         "label{display:block;margin-top:1rem}input{box-sizing:border-box;width:100%;padding:.7rem}"
         "button{margin-top:1.2rem;padding:.8rem 1.2rem}</style></head><body>"
-        "<h1>Radio WLAN</h1>"
-        "<p>WLAN-Zugangsdaten eingeben. Das Geraet startet danach neu.</p>"
+        "<h1>Radio Wi-Fi Setup</h1>"
+        "<p>Replace the stored Wi-Fi credentials. The device will restart after saving.</p>"
         "<form method='post' action='/save'>"
-        "<label>WLAN-Name (SSID)<input name='ssid' maxlength='32' required></label>"
-        "<label>Passwort<input name='password' type='password' maxlength='64'></label>"
-        "<button type='submit'>Speichern</button></form></body></html>");
+        "<label>Wi-Fi network name (SSID)<input name='ssid' maxlength='32' required></label>"
+        "<label>Password<input name='password' type='password' maxlength='64'></label>"
+        "<button type='submit'>Replace and restart</button></form>"
+        "<hr><h2>Erase stored credentials</h2>"
+        "<p>After restart, compiled fallback credentials are used when available.</p>"
+        "<form method='post' action='/erase'>"
+        "<label>Type ERASE to confirm<input name='confirm' pattern='ERASE' autocomplete='off' required></label>"
+        "<button type='submit'>Erase and restart</button></form></body></html>");
 }
 
 void handleRoot()
@@ -57,45 +234,62 @@ void handleSave()
     const String password = webServer.arg("password");
     Serial.printf("[WIFI] Configuration received for SSID=\"%s\"\n",
                   ssid.c_str());
-    if (ssid.isEmpty() || ssid.length() > 32 || password.length() > 64)
+    if (ssid.isEmpty() || ssid.length() > MAX_SSID_LENGTH ||
+        password.length() > MAX_PASSWORD_LENGTH)
     {
         Serial.println("[WIFI] Configuration rejected: invalid field length");
         webServer.send(400,
                        "text/plain; charset=utf-8",
-                       "Ungueltige WLAN-Zugangsdaten.");
+                       "Invalid Wi-Fi credentials.");
         return;
     }
 
-    Preferences preferences;
-    if (!preferences.begin(PREFERENCES_NAMESPACE, false))
-    {
-        Serial.println("[WIFI] Preferences open failed while saving");
-        webServer.send(500,
-                       "text/plain; charset=utf-8",
-                       "Speichern fehlgeschlagen.");
-        return;
-    }
-    const size_t ssidBytes = preferences.putString(SSID_KEY, ssid);
-    const size_t passwordBytes = preferences.putString(PASSWORD_KEY, password);
-    preferences.end();
-
-    if (ssidBytes == 0 || (!password.isEmpty() && passwordBytes == 0))
+    if (!saveStoredCredentialRecord(ssid, password))
     {
         Serial.println("[WIFI] Preferences write failed");
         webServer.send(500,
                        "text/plain; charset=utf-8",
-                       "Speichern fehlgeschlagen.");
+                       "Could not save the Wi-Fi credentials.");
         return;
     }
 
     webServer.send(200,
                    "text/html; charset=utf-8",
-                   "<!doctype html><html lang='de'><meta charset='utf-8'>"
+                   "<!doctype html><html lang='en'><meta charset='utf-8'>"
                    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-                   "<body><h1>Gespeichert</h1><p>Das Geraet startet neu.</p></body></html>");
+                   "<body><h1>Saved</h1><p>The device is restarting.</p></body></html>");
     restartRequested = true;
     restartRequestedMs = millis();
     Serial.println("[WIFI] Configuration saved; restart scheduled");
+}
+
+void handleErase()
+{
+    if (webServer.arg("confirm") != "ERASE")
+    {
+        Serial.println("[WIFI] Credential erase rejected: confirmation missing");
+        webServer.send(400,
+                       "text/plain; charset=utf-8",
+                       "Type ERASE to confirm deletion.");
+        return;
+    }
+
+    if (!eraseStoredCredentialRecord())
+    {
+        webServer.send(500,
+                       "text/plain; charset=utf-8",
+                       "Could not erase the stored Wi-Fi credentials.");
+        return;
+    }
+
+    webServer.send(200,
+                   "text/html; charset=utf-8",
+                   "<!doctype html><html lang='en'><meta charset='utf-8'>"
+                   "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+                   "<body><h1>Erased</h1><p>The device is restarting.</p></body></html>");
+    restartRequested = true;
+    restartRequestedMs = millis();
+    Serial.println("[WIFI] Stored credentials erased; restart scheduled");
 }
 
 void configurePortalHandlers()
@@ -106,6 +300,7 @@ void configurePortalHandlers()
     }
     webServer.on("/", HTTP_GET, handleRoot);
     webServer.on("/save", HTTP_POST, handleSave);
+    webServer.on("/erase", HTTP_POST, handleErase);
     webServer.onNotFound(handleRoot);
     portalHandlersConfigured = true;
 }
@@ -154,20 +349,20 @@ void startStationConnection()
 
 bool loadLocalCredentials()
 {
-    static_assert(sizeof(WifiSecrets::SSID) - 1U <= 32U,
+    static_assert(sizeof(WifiSecrets::SSID) - 1U <= MAX_SSID_LENGTH,
                   "The local WiFi SSID must not exceed 32 characters");
-    static_assert(sizeof(WifiSecrets::PASSWORD) - 1U <= 64U,
+    static_assert(sizeof(WifiSecrets::PASSWORD) - 1U <= MAX_PASSWORD_LENGTH,
                   "The local WiFi password must not exceed 64 characters");
 
     if (WifiSecrets::SSID[0] == '\0' || WifiSecrets::PASSWORD[0] == '\0')
     {
-        Serial.println("[WIFI] Local credentials incomplete; checking Preferences");
+        Serial.println("[WIFI] Compiled fallback credentials incomplete");
         return false;
     }
 
     configuredSsid = WifiSecrets::SSID;
     configuredPassword = WifiSecrets::PASSWORD;
-    Serial.printf("[WIFI] Local credentials selected: SSID=\"%s\"\n",
+    Serial.printf("[WIFI] Compiled fallback credentials selected: SSID=\"%s\"\n",
                   configuredSsid.c_str());
     return true;
 }
@@ -175,17 +370,51 @@ bool loadLocalCredentials()
 bool loadStoredCredentials()
 {
     Preferences preferences;
-    if (!preferences.begin(PREFERENCES_NAMESPACE, false))
+    if (!preferences.begin(PREFERENCES_NAMESPACE, true))
     {
-        Serial.println("[WIFI] Preferences namespace open/create failed");
+        Serial.println("[WIFI] Stored credentials not available");
         return false;
     }
-    configuredSsid = preferences.getString(SSID_KEY, "");
-    configuredPassword = preferences.getString(PASSWORD_KEY, "");
+    const uint8_t activeSlot =
+        preferences.getUChar(ACTIVE_CREDENTIAL_SLOT_KEY,
+                             INVALID_CREDENTIAL_SLOT);
+    CredentialRecord record;
+    if (readCredentialSlot(preferences, activeSlot, record))
+    {
+        preferences.end();
+        configuredSsid = String(record.ssid);
+        configuredPassword = String(record.password);
+        Serial.printf("[WIFI] Stored credential record version=%u slot=%u selected: SSID=\"%s\"\n",
+                      record.version,
+                      activeSlot,
+                      configuredSsid.c_str());
+        return true;
+    }
+
+    const String storedSsid = preferences.getString(SSID_KEY, "");
+    const String storedPassword = preferences.getString(PASSWORD_KEY, "");
     preferences.end();
-    Serial.printf("[WIFI] Stored credentials: %s\n",
-                  configuredSsid.isEmpty() ? "not found" : "SSID found");
-    return !configuredSsid.isEmpty();
+
+    if (storedSsid.isEmpty() || storedSsid.length() > MAX_SSID_LENGTH ||
+        storedPassword.length() > MAX_PASSWORD_LENGTH)
+    {
+        Serial.println("[WIFI] Stored credentials missing or invalid");
+        return false;
+    }
+
+    configuredSsid = storedSsid;
+    configuredPassword = storedPassword;
+    Serial.printf("[WIFI] Legacy stored credentials selected: SSID=\"%s\"\n",
+                  configuredSsid.c_str());
+    if (saveStoredCredentialRecord(configuredSsid, configuredPassword))
+    {
+        Serial.println("[WIFI] Legacy credentials migrated to versioned record");
+    }
+    else
+    {
+        Serial.println("[WIFI] Legacy credential migration failed; using legacy data for this boot");
+    }
+    return true;
 }
 } // namespace
 
@@ -198,7 +427,7 @@ void begin()
     stationConnectedOnce = false;
     stationAttempt = 0;
     currentState = State::Idle;
-    if (loadLocalCredentials() || loadStoredCredentials())
+    if (loadStoredCredentials() || loadLocalCredentials())
     {
         startStationConnection();
     }
@@ -206,6 +435,19 @@ void begin()
     {
         startPortal();
     }
+}
+
+bool openSetupPortal()
+{
+    if (currentState == State::Portal)
+    {
+        return true;
+    }
+
+    restartRequested = false;
+    Serial.println("[WIFI] Setup portal requested by local key gesture");
+    startPortal();
+    return currentState == State::Portal;
 }
 
 void update()

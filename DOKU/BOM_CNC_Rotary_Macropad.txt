@@ -1,19 +1,12 @@
 CNC ROTARY MACROPAD - BILL OF MATERIALS (BOM)
 ================================================
 
-POS-001 | 1x ESP32-S3 WROOM-1-N16R8 ESP32-S3-DevKitC-1
-  Board name: ESP32-S3 WROOM-1-N16R8 ESP32-S3-DevKitC-1
-  Module: ESP32-S3-WROOM-1-N16R8
-  Memory: 16 MB QSPI flash, 8 MB OPI PSRAM
-  Amazon ASIN: B0FYFF8CB2
-    https://www.amazon.de/dp/B0FYFF8CB2
-  Alternative suppliers:
-  Makeroo:
-    https://makeroo.de/products/esp32-s3-n16r8-dev-kit-dual-usb-c-16mb-flash-8mb-psram-ai-optimiert-wifi-bluetooth-microcontroller
-  HESTORE: ESP32-S3-DEV-N16R8
-    https://www.hestore.eu/de/prod_10048179.html
-  Waveshare compatible version: manufacturer part number 28409
-    https://www.waveshare.com/esp32-s3-dev-kit-n8r8.htm?sku=28409
+POS-001 | 1x Seeed Studio XIAO ESP32S3
+  Board name: Seeed Studio XIAO ESP32S3
+  PlatformIO board: seeed_xiao_esp32s3
+  Use: permanent controller board; 3.3 V logic
+  Supplier: Seeed Studio
+    https://www.seeedstudio.com/XIAO-ESP32S3-p-5627.html
 
 POS-002 | 1x NeoKey 5x6 Ortho Snap-Apart PCB
   Use: split into one 3x4 section with 12 keys
